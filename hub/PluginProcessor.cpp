@@ -1,0 +1,1190 @@
+#include "PluginProcessor.h"
+#include "PluginEditor.h"
+
+#include "protocol/Registry.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <string>
+#include <thread>
+#include <vector>
+
+#if defined(_WIN32)
+    #include <windows.h>
+    static std::uint64_t currentPid() { return static_cast<std::uint64_t>(::GetCurrentProcessId()); }
+    static bool isPidAlive(std::uint64_t pid) {
+        if (pid == 0) return false;
+        HANDLE h = ::OpenProcess(SYNCHRONIZE, FALSE, static_cast<DWORD>(pid));
+        if (h == nullptr) return false;
+        const auto r = ::WaitForSingleObject(h, 0);
+        ::CloseHandle(h);
+        return r == WAIT_TIMEOUT;
+    }
+#else
+    #include <unistd.h>
+    #include <signal.h>
+    #include <errno.h>
+    static std::uint64_t currentPid() { return static_cast<std::uint64_t>(::getpid()); }
+    static bool isPidAlive(std::uint64_t pid) {
+        if (pid == 0) return false;
+        // kill(pid, 0): 0 = alive; -1 with ESRCH = no such process; EPERM = exists but no perm.
+        if (::kill(static_cast<pid_t>(pid), 0) == 0) return true;
+        return errno == EPERM;
+    }
+#endif
+
+using namespace gatherer;
+using namespace gatherer::protocol;
+
+namespace {
+constexpr float kGainDbMin = -60.0f;
+constexpr float kGainDbMax =  12.0f;
+
+inline float dbToLin(float db) {
+    if (db <= -99.0f) return 0.0f;
+    return std::pow(10.0f, db / 20.0f);
+}
+inline float linToDb(float lin) {
+    if (lin <= 1e-7f) return -100.0f;
+    return 20.0f * std::log10(lin);
+}
+}
+
+HubProcessor::HubProcessor()
+    : juce::AudioProcessor(BusesProperties()
+        .withInput("Input",   juce::AudioChannelSet::stereo(), true)
+        .withOutput("Output", juce::AudioChannelSet::stereo(), true)),
+      session_(*this)
+{
+    my_uuid_ = generateInstanceId();
+    // Standalone defaults to summing system-audio input with the sat mix (otherwise
+    // the standalone has no use for its audio device input). In-DAW VST3 defaults to
+    // discarding the track's input (matches the hub-on-parent-bus topology, which is
+    // the recommended usage).
+    include_track_input_.store(wrapperType == wrapperType_Standalone,
+                               std::memory_order_relaxed);
+
+    // Set up AudioThumbnail infrastructure. Format manager only needs basic
+    // formats registered (we feed thumbnails via addBlock, no file reading,
+    // but the API requires a manager).
+    thumb_format_manager_.registerBasicFormats();
+    for (std::size_t i = 0; i < thumbnails_.size(); ++i) {
+        thumbnails_[i] = std::make_unique<juce::AudioThumbnail>(
+            /*sourceSamplesPerThumbSample*/ 512,
+            thumb_format_manager_,
+            thumb_cache_);
+    }
+
+    attachToShm();
+}
+
+HubProcessor::~HubProcessor() {
+    // Stop any in-flight recording before detaching from the shared region —
+    // the writer threads read the satellite rings via region_ pointers.
+    if (recorder_) recorder_->stop();
+    recorder_.reset();
+    normalizer_.reset();  // joins its own thread in dtor
+    detachFromShm();
+}
+
+void HubProcessor::attachToShm() {
+    try {
+        shm_ = std::make_unique<SharedMemory>(SHM_NAME, sizeof(SharedRegion),
+                                              SharedMemory::Mode::OpenOrCreate);
+        region_ = static_cast<SharedRegion*>(shm_->data());
+
+        if (shm_->isOwner()) {
+            initializeNewRegion(*region_);
+        } else {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (!isInitialized(*region_)) {
+                if (std::chrono::steady_clock::now() > deadline) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        }
+
+        region_->header.instance_refcount.fetch_add(1, std::memory_order_acq_rel);
+        is_hub_ = claimHub(*region_, my_uuid_, currentPid());
+
+        // One-shot cleanup of stale slots left over from prior host processes
+        // (e.g., a Bitwig session that exited without destructing its sat
+        // plugins). PID-based; live sats stay untouched.
+        if (is_hub_) reclaimGhostSlots();
+    } catch (const std::exception&) {
+        shm_.reset();
+        region_ = nullptr;
+        is_hub_ = false;
+    }
+}
+
+void HubProcessor::detachFromShm() {
+    if (region_) {
+        if (is_hub_) releaseHub(*region_, my_uuid_);
+        region_->header.instance_refcount.fetch_sub(1, std::memory_order_acq_rel);
+        region_ = nullptr;
+    }
+    shm_.reset();
+    is_hub_ = false;
+}
+
+void HubProcessor::prepareToPlay(double sampleRate, int samplesPerBlock) {
+    max_block_size_ = samplesPerBlock;
+    scratch_.assign(static_cast<std::size_t>(samplesPerBlock) * RING_CHANNELS, 0.0f);
+
+    for (auto& sl : lufs_) {
+        sl.analyzer = std::make_unique<gatherer::measurement::LoudnessAnalyzer>(2, sampleRate);
+        sl.integrated .store(-100.0f, std::memory_order_relaxed);
+        sl.momentary  .store(-100.0f, std::memory_order_relaxed);
+        sl.short_term .store(-100.0f, std::memory_order_relaxed);
+        sl.query_counter = 0;
+    }
+
+    playback_.prepare(sampleRate, samplesPerBlock);
+
+    // Report 1-block PDC latency so the host can compensate. The hub may receive a
+    // satellite's data either same-block (if upstream) or next-block (if parallel);
+    // declaring max_block_size of latency gives a deterministic upper bound.
+    setLatencySamples(samplesPerBlock);
+
+    if (region_ != nullptr && is_hub_) {
+        region_->header.sample_rate.store(static_cast<std::uint32_t>(sampleRate),
+                                          std::memory_order_release);
+        region_->header.max_block_size.store(static_cast<std::uint32_t>(samplesPerBlock),
+                                             std::memory_order_release);
+    }
+}
+
+void HubProcessor::releaseResources() {}
+
+bool HubProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const {
+    return layouts.getMainOutputChannelSet() == juce::AudioChannelSet::stereo()
+        && (layouts.getMainInputChannelSet() == juce::AudioChannelSet::stereo()
+            || layouts.getMainInputChannelSet() == juce::AudioChannelSet::disabled());
+}
+
+void HubProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer&) {
+    juce::ScopedNoDenormals noDenormals;
+    const int frames = buffer.getNumSamples();
+
+    // Input handling — see isIncludeTrackInput() doc.
+    //   OFF: discard whatever the host gave us; output is purely the sat-ring mix.
+    //   ON : keep the input buffer as a source; sum sat-ring contributions on top.
+    const bool keep_input = include_track_input_.load(std::memory_order_relaxed);
+    if (!keep_input) buffer.clear();
+
+    if (region_ == nullptr || !is_hub_) return;
+
+    region_->header.hub_heartbeat.fetch_add(1, std::memory_order_relaxed);
+
+    // Stash the host's transport play-state for the message thread (Record
+    // button handler reads it to decide immediate-vs-deferred start).
+    // If the user pre-armed a record while transport was stopped and
+    // transport has now flipped to playing, post a one-shot to the message
+    // thread so actuallyStartRecording happens there (writers / files are
+    // not RT-safe to create on the audio thread).
+    {
+        bool playing_now = false;
+        if (auto* ph = getPlayHead()) {
+            if (auto pos = ph->getPosition()) {
+                playing_now = pos->getIsPlaying();
+            }
+        }
+        last_seen_playing_.store(playing_now, std::memory_order_release);
+
+        if (playing_now
+            && armed_pending_.load(std::memory_order_acquire)
+            && !play_trigger_posted_.exchange(true, std::memory_order_acq_rel)) {
+            // Race-free wp snapshot: one audio callback sees a single
+            // atomic point in time for every slot. All armed slots'
+            // recording_start_wp_ get the wp from THIS block's tail, so
+            // every recording begins at the same DAW frame.
+            for (std::uint32_t i = 0; i < NUM_SLOTS; ++i) {
+                if (region_->slots[i].state.load(std::memory_order_acquire) != SLOT_STATE_ACTIVE) continue;
+                if (!mix_[i].record_arm.load(std::memory_order_relaxed)) continue;
+                const auto wp = region_->slots[i].ring_header.write_pos
+                                    .load(std::memory_order_acquire);
+                recording_start_wp_[i].store(wp, std::memory_order_release);
+                recording_active_  [i].store(true, std::memory_order_release);
+                grid_.per_slot[i].captured.store(false, std::memory_order_release);
+            }
+            juce::MessageManager::callAsync([this] {
+                play_trigger_posted_.store(false, std::memory_order_release);
+                if (!armed_pending_.exchange(false, std::memory_order_acq_rel)) return;
+                actuallyStartRecording();
+            });
+        }
+    }
+
+    // Grid capture — runs only while recording AND transport is playing.
+    //
+    // Session-level (bpm + time sig) is captured once per session.
+    //
+    // Per-slot start_in_seconds/beats is captured for each individual recording
+    // (so re-recording a single track from a new DAW position keeps that lane's
+    // grid honest, independent of any earlier recordings in the same session).
+    //
+    // Sample-accurate back-correction:
+    //   playhead.getTimeInSamples() is the frame at the START of this block.
+    //   sat is upstream and has already written this block, so sat.wp_now =
+    //   sat.wp_at_block_start + frames. delta = wp_now − recording_start_wp.
+    //   Recording sample-0 is at wp=recording_start_wp, which corresponds to
+    //   DAW frame (block_end_frame − delta) = (playhead + frames) − delta.
+    if (recorder_ && recorder_->isRecording()) {
+        if (auto* ph = getPlayHead()) {
+            if (auto pos = ph->getPosition()) {
+                if (pos->getIsPlaying()) {
+                    // Session-level once.
+                    if (!grid_.captured.load(std::memory_order_acquire)) {
+                        if (auto bpm = pos->getBpm())           grid_.bpm = *bpm;
+                        if (auto ts  = pos->getTimeSignature()) {
+                            grid_.time_sig_num = ts->numerator;
+                            grid_.time_sig_den = ts->denominator;
+                        }
+                        grid_.captured.store(true, std::memory_order_release);
+                    }
+
+                    double now_seconds = 0.0, now_beats = 0.0;
+                    if (auto s = pos->getTimeInSeconds()) now_seconds = *s;
+                    if (auto p = pos->getPpqPosition())   now_beats   = *p;
+
+                    const double sr            = getSampleRate();
+                    const double block_dur_s   = (sr > 0.0) ? (frames / sr) : 0.0;
+                    const double block_dur_b   = block_dur_s * grid_.bpm / 60.0;
+
+                    // Per-slot — but only once this slot's sat has actually
+                    // written something. Some hosts (Bitwig) gate processBlock
+                    // by clip presence: a non-input-armed track's sat won't
+                    // write until its clip starts playing. If we captured at
+                    // delta == 0, the slot would claim sample 0 = play start
+                    // even though the WAV's sample 0 corresponds to clip start
+                    // — the rendered lane would misalign by exactly that gap.
+                    // Waiting for delta > 0 anchors start_in_beats to the
+                    // first DAW frame the sat actually wrote.
+                    for (std::uint32_t i = 0; i < NUM_SLOTS; ++i) {
+                        if (!recording_active_[i].load(std::memory_order_acquire)) continue;
+                        auto& ps = grid_.per_slot[i];
+                        if (ps.captured.load(std::memory_order_acquire)) continue;
+                        if (region_->slots[i].state.load(std::memory_order_acquire) != SLOT_STATE_ACTIVE) continue;
+
+                        const auto start_wp = recording_start_wp_[i].load(std::memory_order_acquire);
+                        const auto sat_wp   = region_->slots[i].ring_header.write_pos
+                                                  .load(std::memory_order_acquire);
+                        const std::int64_t delta = static_cast<std::int64_t>(sat_wp)
+                                                 - static_cast<std::int64_t>(start_wp);
+                        if (delta <= 0) continue;  // sat hasn't written yet
+
+                        const double delta_s = (sr > 0.0)
+                            ? static_cast<double>(delta) / sr : 0.0;
+                        const double delta_b = delta_s * grid_.bpm / 60.0;
+
+                        ps.start_in_seconds.store(now_seconds + block_dur_s - delta_s,
+                                                  std::memory_order_relaxed);
+                        ps.start_in_beats  .store(now_beats   + block_dur_b - delta_b,
+                                                  std::memory_order_relaxed);
+                        ps.captured.store(true, std::memory_order_release);
+                    }
+                }
+            }
+        }
+    }
+
+    const auto target_lag = static_cast<std::uint64_t>(max_block_size_);
+
+    // Mixer mode: if any active slot has solo on, only soloed slots contribute.
+    bool any_solo_active = false;
+    for (std::uint32_t s = 0; s < NUM_SLOTS; ++s) {
+        if (region_->slots[s].state.load(std::memory_order_acquire) != SLOT_STATE_ACTIVE) continue;
+        if (mix_[s].solo.load(std::memory_order_relaxed)) { any_solo_active = true; break; }
+    }
+
+    auto* L = buffer.getWritePointer(0);
+    auto* R = buffer.getNumChannels() > 1 ? buffer.getWritePointer(1) : nullptr;
+
+    const bool transport_playing = playback_.isPlaying();
+
+    // Per-callback re-anchored peek. We don't cache a read position — instead we always
+    // read at (current wp - current target_lag). Benefits:
+    //   - Immune to prepareToPlay reporting a transient large samplesPerBlock at startup
+    //     (which used to leave us drifting at a stale lag forever).
+    //   - peekAt doesn't touch the shared read_pos, so no race with satellite's overrun.
+    //   - When hub is double-called (wp unchanged), we skip the read instead of duplicating
+    //     the previous output block (which was the source of transient artifacts).
+    for (std::uint32_t s = 0; s < NUM_SLOTS; ++s) {
+        auto& slot = region_->slots[s];
+        if (slot.state.load(std::memory_order_acquire) != SLOT_STATE_ACTIVE) continue;
+
+        // Source selection: when transport is Playing AND this slot has a loaded
+        // playback source, read from the file. Otherwise fall back to live sat
+        // audio. This lets the user review recordings while uninstalled sats
+        // continue playing live.
+        bool have_data = false;
+        if (transport_playing && playback_.hasSourceForSlot(static_cast<int>(s))) {
+            have_data = playback_.readSlotIntoInterleaved(
+                static_cast<int>(s), scratch_.data(), frames);
+        }
+        if (!have_data) {
+            SpscRingBuffer rb(slot.ring_header, slot.ring_data, RING_FRAMES, RING_CHANNELS);
+            const auto wp   = rb.writePos();
+            const auto uuid = slot.sat_uuid.load(std::memory_order_acquire);
+            auto& state     = slot_states_[s];
+
+            if (state.last_uuid != uuid) {
+                state.last_uuid    = uuid;
+                state.last_seen_wp = 0;
+            }
+
+            if (wp == state.last_seen_wp) continue;
+            state.last_seen_wp = wp;
+
+            if (wp < target_lag) continue;
+
+            if (!rb.peekAt(wp - target_lag,
+                           scratch_.data(),
+                           static_cast<std::uint32_t>(frames))) continue;
+        }
+
+        // LUFS metering — pre-fader, same signal as peak/RMS metering.
+        {
+            auto& sl = lufs_[s];
+            if (sl.analyzer) {
+                sl.analyzer->addInterleavedFloat(scratch_.data(),
+                                                 static_cast<std::size_t>(frames));
+                if (++sl.query_counter >= 10) {
+                    sl.query_counter = 0;
+                    sl.integrated.store(
+                        static_cast<float>(sl.analyzer->integratedLufs()),
+                        std::memory_order_relaxed);
+                    sl.momentary.store(
+                        static_cast<float>(sl.analyzer->momentaryLufs()),
+                        std::memory_order_relaxed);
+                    sl.short_term.store(
+                        static_cast<float>(sl.analyzer->shortTermLufs()),
+                        std::memory_order_relaxed);
+                }
+            }
+        }
+
+        // Mix gating: a slot contributes to the master mix unless it's muted,
+        // or another slot is soloed and this one isn't.
+        const bool  muted       = mix_[s].mute    .load(std::memory_order_relaxed);
+        const bool  this_solo   = mix_[s].solo    .load(std::memory_order_relaxed);
+        const float vol_gain    = mix_[s].gain_lin.load(std::memory_order_relaxed);
+        const float norm_gain   = mix_[s].norm_lin.load(std::memory_order_relaxed);
+        const float gain        = vol_gain * norm_gain;
+        const bool  contributes = !muted && (!any_solo_active || this_solo);
+
+        // Pre-fader L/R metering — reflects what the sat is producing, irrespective
+        // of gain/mute/solo. The user can see incoming activity even on a muted layer.
+        float  block_peak_l = 0.0f, block_peak_r = 0.0f;
+        double block_sumsq_l = 0.0, block_sumsq_r = 0.0;
+        for (int i = 0; i < frames; ++i) {
+            const float l = scratch_[static_cast<std::size_t>(i) * RING_CHANNELS + 0];
+            const float r = scratch_[static_cast<std::size_t>(i) * RING_CHANNELS + 1];
+            block_peak_l = std::max(block_peak_l, std::abs(l));
+            block_peak_r = std::max(block_peak_r, std::abs(r));
+            block_sumsq_l += static_cast<double>(l) * l;
+            block_sumsq_r += static_cast<double>(r) * r;
+            if (contributes) {
+                L[i] += l * gain;
+                if (R) R[i] += r * gain;
+            }
+        }
+        const float block_rms_l = std::sqrt(static_cast<float>(
+            block_sumsq_l / static_cast<double>(frames)));
+        const float block_rms_r = std::sqrt(static_cast<float>(
+            block_sumsq_r / static_cast<double>(frames)));
+
+        auto& lvl = levels_[s];
+        // Peak ballistics: instant attack, ~10 dB/sec decay.
+        const float prev_pl = lvl.peak_lin_l.load(std::memory_order_relaxed);
+        const float prev_pr = lvl.peak_lin_r.load(std::memory_order_relaxed);
+        lvl.peak_lin_l.store(std::max(prev_pl * 0.97f, block_peak_l),
+                             std::memory_order_relaxed);
+        lvl.peak_lin_r.store(std::max(prev_pr * 0.97f, block_peak_r),
+                             std::memory_order_relaxed);
+        const float prev_rl = lvl.rms_lin_l.load(std::memory_order_relaxed);
+        const float prev_rr = lvl.rms_lin_r.load(std::memory_order_relaxed);
+        lvl.rms_lin_l.store(prev_rl * 0.7f + block_rms_l * 0.3f,
+                            std::memory_order_relaxed);
+        lvl.rms_lin_r.store(prev_rr * 0.7f + block_rms_r * 0.3f,
+                            std::memory_order_relaxed);
+    }
+
+    if (transport_playing) playback_.advancePlayhead(frames);
+}
+
+juce::AudioProcessorEditor* HubProcessor::createEditor() {
+    return new HubEditor(*this);
+}
+
+void HubProcessor::getStateInformation(juce::MemoryBlock& destData) {
+    juce::ValueTree tree("GathererHub");
+    tree.setProperty("uuid_hi", static_cast<juce::int64>(my_uuid_ >> 32), nullptr);
+    tree.setProperty("uuid_lo", static_cast<juce::int64>(my_uuid_ & 0xFFFFFFFFull), nullptr);
+    tree.setProperty("include_track_input",
+                     include_track_input_.load(std::memory_order_relaxed), nullptr);
+    tree.setProperty("target_lufs",
+                     target_lufs_.load(std::memory_order_relaxed), nullptr);
+    tree.setProperty("session_folder", session_.serializeForPluginState(), nullptr);
+
+    juce::ValueTree mix("mix");
+    for (std::size_t i = 0; i < mix_.size(); ++i) {
+        juce::ValueTree slot("slot");
+        slot.setProperty("i",    static_cast<int>(i), nullptr);
+        slot.setProperty("mute", mix_[i].mute.load(std::memory_order_relaxed), nullptr);
+        slot.setProperty("solo", mix_[i].solo.load(std::memory_order_relaxed), nullptr);
+        slot.setProperty("gain_db",
+                          linToDb(mix_[i].gain_lin.load(std::memory_order_relaxed)),
+                          nullptr);
+        slot.setProperty("norm_db",
+                          linToDb(mix_[i].norm_lin.load(std::memory_order_relaxed)),
+                          nullptr);
+        slot.setProperty("target_lufs",
+                          mix_[i].target_lufs.load(std::memory_order_relaxed),
+                          nullptr);
+        slot.setProperty("record_arm",
+                          mix_[i].record_arm.load(std::memory_order_relaxed), nullptr);
+        mix.appendChild(slot, nullptr);
+    }
+    tree.appendChild(mix, nullptr);
+
+    juce::MemoryOutputStream stream(destData, false);
+    tree.writeToStream(stream);
+}
+
+void HubProcessor::setStateInformation(const void* data, int sizeInBytes) {
+    if (data == nullptr || sizeInBytes <= 0) return;
+    // State restore is not itself undoable. Clear the stack so a freshly loaded
+    // project doesn't start with bizarre cross-session undo entries.
+    command_stack_.clear();
+    juce::MemoryInputStream stream(data, static_cast<std::size_t>(sizeInBytes), false);
+    auto tree = juce::ValueTree::readFromStream(stream);
+    if (!tree.isValid() || tree.getType() != juce::Identifier("GathererHub")) return;
+
+    if (tree.hasProperty("include_track_input")) {
+        include_track_input_.store(static_cast<bool>(tree["include_track_input"]),
+                                   std::memory_order_relaxed);
+    }
+    if (tree.hasProperty("target_lufs")) {
+        target_lufs_.store(static_cast<float>(static_cast<double>(tree["target_lufs"])),
+                           std::memory_order_relaxed);
+    }
+    if (tree.hasProperty("session_folder")) {
+        session_.restoreFromPluginState(tree["session_folder"].toString());
+    }
+
+    auto mix = tree.getChildWithName("mix");
+    if (mix.isValid()) {
+        for (int c = 0; c < mix.getNumChildren(); ++c) {
+            auto slot = mix.getChild(c);
+            const int i = slot.getProperty("i", -1);
+            if (i < 0 || i >= static_cast<int>(mix_.size())) continue;
+            mix_[i].mute.store(static_cast<bool>(slot.getProperty("mute", false)),
+                                std::memory_order_relaxed);
+            mix_[i].solo.store(static_cast<bool>(slot.getProperty("solo", false)),
+                                std::memory_order_relaxed);
+            const float db = static_cast<float>(static_cast<double>(slot.getProperty("gain_db", 0.0)));
+            mix_[i].gain_lin.store(dbToLin(juce::jlimit(kGainDbMin, kGainDbMax, db)),
+                                    std::memory_order_relaxed);
+            const float norm_db = static_cast<float>(static_cast<double>(slot.getProperty("norm_db", 0.0)));
+            mix_[i].norm_lin.store(dbToLin(juce::jlimit(kGainDbMin, kGainDbMax, norm_db)),
+                                    std::memory_order_relaxed);
+            const float t = static_cast<float>(static_cast<double>(slot.getProperty(
+                "target_lufs", static_cast<double>(target_lufs_.load(std::memory_order_relaxed)))));
+            mix_[i].target_lufs.store(juce::jlimit(-60.0f, 0.0f, t),
+                                       std::memory_order_relaxed);
+            mix_[i].record_arm.store(static_cast<bool>(slot.getProperty("record_arm", false)),
+                                      std::memory_order_relaxed);
+        }
+    }
+    // (UUID is not restored — we keep the freshly generated one so a project reload
+    // doesn't fight over hub_uuid with another instance.)
+}
+
+int HubProcessor::activeSatellites() const noexcept {
+    if (region_ == nullptr) return 0;
+    int n = 0;
+    for (const auto& slot : region_->slots) {
+        if (slot.state.load(std::memory_order_acquire) == SLOT_STATE_ACTIVE) ++n;
+    }
+    return n;
+}
+
+std::vector<HubProcessor::SatelliteSnapshot> HubProcessor::snapshotSatellites() const {
+    std::vector<SatelliteSnapshot> out;
+    if (region_ == nullptr) return out;
+    for (std::uint32_t i = 0; i < NUM_SLOTS; ++i) {
+        const auto& slot = region_->slots[i];
+        if (slot.state.load(std::memory_order_acquire) != SLOT_STATE_ACTIVE) continue;
+        SatelliteSnapshot snap;
+        snap.slot_index            = static_cast<int>(i);
+        snap.uuid                  = slot.sat_uuid.load(std::memory_order_acquire);
+        snap.display_name          = juce::String::fromUTF8(slot.display_name);
+        snap.track_name            = juce::String::fromUTF8(slot.track_name);
+        snap.heartbeat             = static_cast<std::uint32_t>(slot.sat_heartbeat.load(std::memory_order_relaxed));
+        snap.write_pos             = slot.ring_header.write_pos.load(std::memory_order_acquire);
+        snap.last_write_host_frame = slot.last_write_host_frame.load(std::memory_order_relaxed);
+        snap.color_rgba            = slot.color_rgba;
+        out.push_back(std::move(snap));
+    }
+    return out;
+}
+
+void HubProcessor::reclaimGhostSlots() {
+    if (region_ == nullptr) return;
+
+    for (std::uint32_t i = 0; i < NUM_SLOTS; ++i) {
+        auto& slot = region_->slots[i];
+        if (slot.state.load(std::memory_order_acquire) != SLOT_STATE_ACTIVE) continue;
+
+        const auto pid = slot.sat_pid.load(std::memory_order_acquire);
+        if (isPidAlive(pid)) continue;  // sat process is alive — leave it alone
+
+        // Ghost: the owning process no longer exists (host exited without
+        // destructing the plugin, crash, etc.). Reset the slot so a fresh
+        // claim can take it.
+        slot.sat_uuid.store(0, std::memory_order_release);
+        slot.sat_pid.store(0, std::memory_order_release);
+        slot.state.store(SLOT_STATE_EMPTY, std::memory_order_release);
+
+        slot_states_[i] = {};
+        auto& lvl = levels_[i];
+        lvl.peak_lin_l.store(0.0f, std::memory_order_relaxed);
+        lvl.peak_lin_r.store(0.0f, std::memory_order_relaxed);
+        lvl.rms_lin_l .store(0.0f, std::memory_order_relaxed);
+        lvl.rms_lin_r .store(0.0f, std::memory_order_relaxed);
+        if (lufs_[i].analyzer) lufs_[i].analyzer->reset();
+        lufs_[i].integrated.store(-100.0f, std::memory_order_relaxed);
+        lufs_[i].momentary .store(-100.0f, std::memory_order_relaxed);
+        lufs_[i].short_term.store(-100.0f, std::memory_order_relaxed);
+    }
+}
+
+std::uint64_t HubProcessor::hubHeartbeat() const noexcept {
+    if (region_ == nullptr) return 0;
+    return region_->header.hub_heartbeat.load(std::memory_order_relaxed);
+}
+
+std::uint32_t HubProcessor::maxBlockSize() const noexcept {
+    if (region_ == nullptr) return static_cast<std::uint32_t>(max_block_size_);
+    return region_->header.max_block_size.load(std::memory_order_relaxed);
+}
+
+HubProcessor::LevelSnapshot HubProcessor::getSlotLevels(int slot_index) const noexcept {
+    LevelSnapshot s { -100.0f, -100.0f, -100.0f, -100.0f };
+    if (slot_index < 0 || slot_index >= static_cast<int>(levels_.size())) return s;
+    const auto& lvl = levels_[slot_index];
+
+    const float pl = lvl.peak_lin_l.load(std::memory_order_relaxed);
+    const float pr = lvl.peak_lin_r.load(std::memory_order_relaxed);
+    const float rl = lvl.rms_lin_l .load(std::memory_order_relaxed);
+    const float rr = lvl.rms_lin_r .load(std::memory_order_relaxed);
+
+    s.peak_db_l = (pl > 1e-7f) ? 20.0f * std::log10(pl) : -100.0f;
+    s.peak_db_r = (pr > 1e-7f) ? 20.0f * std::log10(pr) : -100.0f;
+    s.rms_db_l  = (rl > 1e-7f) ? 20.0f * std::log10(rl) : -100.0f;
+    s.rms_db_r  = (rr > 1e-7f) ? 20.0f * std::log10(rr) : -100.0f;
+    return s;
+}
+
+bool HubProcessor::normalizeSlotGainToTarget(int slot_index) noexcept {
+    if (slot_index < 0 || slot_index >= static_cast<int>(lufs_.size())) return false;
+    const float integrated = lufs_[slot_index].integrated.load(std::memory_order_relaxed);
+    if (integrated <= -99.0f) return false;
+    // Per-slot target wins; falls back to global default at row creation time.
+    const float target = mix_[slot_index].target_lufs.load(std::memory_order_relaxed);
+    // LUFS scales 1:1 with dB gain on the source signal. Pre-fader integrated of
+    // -18 LUFS + gain of +4 dB → post-fader contribution of -14 LUFS.
+    setNormalizeDb(slot_index, target - integrated);
+    return true;
+}
+
+void HubProcessor::normalizeAllActiveSlots() noexcept {
+    if (region_ == nullptr) return;
+    for (std::uint32_t i = 0; i < NUM_SLOTS; ++i) {
+        if (region_->slots[i].state.load(std::memory_order_acquire) != SLOT_STATE_ACTIVE) continue;
+        normalizeSlotGainToTarget(static_cast<int>(i));
+    }
+}
+
+float HubProcessor::getNormalizeDb(int slot) const noexcept {
+    if (slot < 0 || slot >= static_cast<int>(mix_.size())) return 0.0f;
+    return linToDb(mix_[slot].norm_lin.load(std::memory_order_relaxed));
+}
+void HubProcessor::setNormalizeDb(int slot, float db) noexcept {
+    if (slot < 0 || slot >= static_cast<int>(mix_.size())) return;
+    db = juce::jlimit(kGainDbMin, kGainDbMax, db);
+    mix_[slot].norm_lin.store(dbToLin(db), std::memory_order_relaxed);
+}
+
+float HubProcessor::getSlotTargetLufs(int slot) const noexcept {
+    if (slot < 0 || slot >= static_cast<int>(mix_.size())) return target_lufs_.load(std::memory_order_relaxed);
+    return mix_[slot].target_lufs.load(std::memory_order_relaxed);
+}
+void HubProcessor::setSlotTargetLufs(int slot, float v) noexcept {
+    if (slot < 0 || slot >= static_cast<int>(mix_.size())) return;
+    mix_[slot].target_lufs.store(juce::jlimit(-60.0f, 0.0f, v), std::memory_order_relaxed);
+}
+
+HubProcessor::LufsSnapshot HubProcessor::getSlotLufs(int slot_index) const noexcept {
+    LufsSnapshot s { -100.0f, -100.0f, -100.0f };
+    if (slot_index < 0 || slot_index >= static_cast<int>(lufs_.size())) return s;
+    const auto& sl = lufs_[slot_index];
+    s.integrated = sl.integrated .load(std::memory_order_relaxed);
+    s.momentary  = sl.momentary  .load(std::memory_order_relaxed);
+    s.short_term = sl.short_term .load(std::memory_order_relaxed);
+    return s;
+}
+
+juce::AudioThumbnail* HubProcessor::getThumbnail(int slot_index) const noexcept {
+    if (slot_index < 0 || slot_index >= static_cast<int>(thumbnails_.size())) return nullptr;
+    return thumbnails_[slot_index].get();
+}
+
+bool HubProcessor::getMute(int slot) const noexcept {
+    if (slot < 0 || slot >= static_cast<int>(mix_.size())) return false;
+    return mix_[slot].mute.load(std::memory_order_relaxed);
+}
+void HubProcessor::setMute(int slot, bool on) noexcept {
+    if (slot < 0 || slot >= static_cast<int>(mix_.size())) return;
+    mix_[slot].mute.store(on, std::memory_order_relaxed);
+}
+bool HubProcessor::getSolo(int slot) const noexcept {
+    if (slot < 0 || slot >= static_cast<int>(mix_.size())) return false;
+    return mix_[slot].solo.load(std::memory_order_relaxed);
+}
+void HubProcessor::setSolo(int slot, bool on) noexcept {
+    if (slot < 0 || slot >= static_cast<int>(mix_.size())) return;
+    mix_[slot].solo.store(on, std::memory_order_relaxed);
+}
+float HubProcessor::getGainDb(int slot) const noexcept {
+    if (slot < 0 || slot >= static_cast<int>(mix_.size())) return 0.0f;
+    return linToDb(mix_[slot].gain_lin.load(std::memory_order_relaxed));
+}
+void HubProcessor::setGainDb(int slot, float db) noexcept {
+    if (slot < 0 || slot >= static_cast<int>(mix_.size())) return;
+    db = juce::jlimit(kGainDbMin, kGainDbMax, db);
+    mix_[slot].gain_lin.store(dbToLin(db), std::memory_order_relaxed);
+}
+
+bool HubProcessor::getRecordArm(int slot) const noexcept {
+    if (slot < 0 || slot >= static_cast<int>(mix_.size())) return false;
+    return mix_[slot].record_arm.load(std::memory_order_relaxed);
+}
+void HubProcessor::setRecordArm(int slot, bool on) noexcept {
+    if (slot < 0 || slot >= static_cast<int>(mix_.size())) return;
+    mix_[slot].record_arm.store(on, std::memory_order_relaxed);
+}
+
+bool HubProcessor::startRecording() {
+    if (region_ == nullptr) return false;
+    if (recorder_ && recorder_->isRecording()) return false;
+    if (armed_pending_.load(std::memory_order_acquire))  return false;
+
+    // Verify something is actually armed (otherwise the audio thread would
+    // do nothing on the next play block and the UI would look stuck).
+    bool any_armed = false;
+    for (std::uint32_t i = 0; i < NUM_SLOTS; ++i) {
+        if (region_->slots[i].state.load(std::memory_order_acquire) != SLOT_STATE_ACTIVE) continue;
+        if (!mix_[i].record_arm.load(std::memory_order_relaxed)) continue;
+        any_armed = true;
+        break;
+    }
+    if (!any_armed) return false;
+
+    // The audio thread will see armed_pending_ + isPlaying on the next block,
+    // snapshot every armed slot's sat.wp in one race-free pass, and post a
+    // callAsync that creates writers from those snapshotted values. This
+    // unifies "DAW playing already" and "DAW paused" into a single deferred
+    // path so the snapshot loop never interleaves with sat audio-thread writes.
+    armed_pending_.store(true, std::memory_order_release);
+    play_trigger_posted_.store(false, std::memory_order_release);
+    return true;
+}
+
+bool HubProcessor::actuallyStartRecording() {
+    // Audio thread has already populated recording_active_ and
+    // recording_start_wp_ for every slot that was armed at the moment of
+    // play-detection. Just turn that into an ArmedLayer list.
+    std::vector<Recorder::ArmedLayer> armed;
+    for (std::uint32_t i = 0; i < NUM_SLOTS; ++i) {
+        if (!recording_active_[i].load(std::memory_order_acquire)) continue;
+        if (region_->slots[i].state.load(std::memory_order_acquire) != SLOT_STATE_ACTIVE) continue;
+        Recorder::ArmedLayer a;
+        a.slot         = static_cast<int>(i);
+        a.track_name   = juce::String::fromUTF8(region_->slots[i].track_name);
+        a.display_name = juce::String::fromUTF8(region_->slots[i].display_name);
+        a.thumbnail    = thumbnails_[i].get();
+        a.start_wp     = recording_start_wp_[i].load(std::memory_order_acquire);
+        armed.push_back(a);
+    }
+    if (armed.empty()) return false;
+    if (!recorder_) recorder_ = std::make_unique<Recorder>(region_);
+    const auto folder = session_.ensureFolderForRecording();
+    return recorder_->start(armed, getSampleRate(), folder);
+}
+
+void HubProcessor::stopRecording() {
+    // Cancel a pending armed-but-not-yet-recording state if the user backs out
+    // before the DAW transport ever starts (or before the message-thread
+    // callAsync that creates writers has run). The audio thread may already
+    // have flipped recording_active_ flags during its snapshot pass — clear
+    // them so the next startRecording starts from a clean slate.
+    if (armed_pending_.exchange(false, std::memory_order_acq_rel)) {
+        for (auto& f : recording_active_) f.store(false, std::memory_order_release);
+        play_trigger_posted_.store(false, std::memory_order_release);
+        return;
+    }
+
+    if (!recorder_ || !recorder_->isRecording()) return;
+
+    for (auto& f : recording_active_) f.store(false, std::memory_order_release);
+
+    // Snapshot the file list BEFORE stop() clears writers_, then drain + finalize.
+    std::vector<juce::File> recorded;
+    for (const auto& s : recorder_->writerStatuses()) {
+        if (s.file.existsAsFile()) recorded.push_back(s.file);
+        // Remember per-slot so the "Delete recording" action can find it later.
+        if (s.slot >= 0 && s.slot < static_cast<int>(last_recordings_.size())) {
+            last_recordings_[s.slot] = s.file;
+        }
+    }
+    recorder_->stop();
+
+    // Load the just-recorded WAVs as playback sources so the user can review.
+    refreshPlaybackSources();
+    recomputeSessionLayout();
+    session_.autoSave();
+    // Normalized WAV files are no longer auto-rendered here — see exportNormalized().
+}
+
+bool HubProcessor::exportNormalized() {
+    std::vector<OfflineNormalizer::Task> tasks;
+    for (std::size_t i = 0; i < last_recordings_.size(); ++i) {
+        const auto& f = last_recordings_[i];
+        if (f == juce::File{} || !f.existsAsFile()) continue;
+        tasks.push_back({f, getNormalizeDb(static_cast<int>(i))});
+    }
+    if (tasks.empty()) return false;
+    normalizer_.reset();  // join previous thread if any
+    normalizer_ = std::make_unique<OfflineNormalizer>(std::move(tasks));
+    normalizer_->startAsync();
+    return true;
+}
+
+bool HubProcessor::isRecording() const noexcept {
+    return recorder_ && recorder_->isRecording();
+}
+
+juce::File HubProcessor::currentRecordingFolder() const {
+    return recorder_ ? recorder_->currentSessionFolder() : juce::File{};
+}
+
+HubProcessor::GridInfo HubProcessor::getCurrentGridInfo() const noexcept {
+    GridInfo out;
+    out.captured = grid_.captured.load(std::memory_order_acquire);
+    if (!out.captured) return out;
+    out.bpm          = grid_.bpm;
+    out.time_sig_num = grid_.time_sig_num;
+    out.time_sig_den = grid_.time_sig_den;
+    // Reference start = first slot that captured (kept for compat with code
+    // paths that don't yet thread per-slot info).
+    for (const auto& ps : grid_.per_slot) {
+        if (ps.captured.load(std::memory_order_acquire)) {
+            out.start_in_seconds = ps.start_in_seconds.load(std::memory_order_relaxed);
+            out.start_in_beats   = ps.start_in_beats  .load(std::memory_order_relaxed);
+            break;
+        }
+    }
+    return out;
+}
+
+void HubProcessor::setCurrentGridInfo(const GridInfo& g) noexcept {
+    grid_.captured.store(false, std::memory_order_relaxed);
+    grid_.bpm          = g.bpm;
+    grid_.time_sig_num = g.time_sig_num;
+    grid_.time_sig_den = g.time_sig_den;
+    grid_.captured.store(g.captured, std::memory_order_release);
+}
+
+HubProcessor::SlotGridInfo HubProcessor::getSlotGridInfo(int slot) const noexcept {
+    SlotGridInfo out;
+    if (slot < 0 || slot >= static_cast<int>(grid_.per_slot.size())) return out;
+    const auto& ps = grid_.per_slot[slot];
+    out.captured = ps.captured.load(std::memory_order_acquire);
+    if (!out.captured) return out;
+    out.start_in_seconds = ps.start_in_seconds.load(std::memory_order_relaxed);
+    out.start_in_beats   = ps.start_in_beats  .load(std::memory_order_relaxed);
+    return out;
+}
+
+void HubProcessor::setSlotGridInfo(int slot, const SlotGridInfo& g) noexcept {
+    if (slot < 0 || slot >= static_cast<int>(grid_.per_slot.size())) return;
+    auto& ps = grid_.per_slot[slot];
+    ps.captured.store(false, std::memory_order_relaxed);
+    ps.start_in_seconds.store(g.start_in_seconds, std::memory_order_relaxed);
+    ps.start_in_beats  .store(g.start_in_beats,   std::memory_order_relaxed);
+    ps.captured.store(g.captured, std::memory_order_release);
+}
+
+void HubProcessor::resetGrid() noexcept {
+    grid_.captured.store(false, std::memory_order_release);
+    for (auto& ps : grid_.per_slot) {
+        ps.captured.store(false, std::memory_order_release);
+    }
+}
+
+double HubProcessor::getSessionStartInBeats() const noexcept {
+    double mn = std::numeric_limits<double>::infinity();
+    for (std::uint32_t i = 0; i < gatherer::protocol::NUM_SLOTS; ++i) {
+        if (!grid_.per_slot[i].captured.load(std::memory_order_acquire)) continue;
+        // Only include slots that contribute to the *current* session — a
+        // recording file on disk, or a live recording in progress. This
+        // filters out stale per-slot grid info that may linger from ghost
+        // slots, deleted recordings, or pre-session-load state — any of
+        // which would otherwise pull the session reference to an irrelevant
+        // earlier position and shift every other lane's grid.
+        const bool has_file = last_recordings_[i] != juce::File{};
+        const bool is_live  = recording_active_[i].load(std::memory_order_acquire);
+        if (!has_file && !is_live) continue;
+        const auto b = grid_.per_slot[i].start_in_beats.load(std::memory_order_relaxed);
+        if (b < mn) mn = b;
+    }
+    return std::isfinite(mn) ? mn : 0.0;
+}
+
+void HubProcessor::recomputeSessionLayout() noexcept {
+    const auto gi = getCurrentGridInfo();
+    const double sr = getSampleRate();
+    if (!gi.captured || gi.bpm <= 0.0 || sr <= 0.0) {
+        for (int i = 0; i < static_cast<int>(gatherer::protocol::NUM_SLOTS); ++i) {
+            playback_.setSlotOffsetSamples(i, 0);
+        }
+        return;
+    }
+    const double session_start = getSessionStartInBeats();
+    for (int i = 0; i < static_cast<int>(gatherer::protocol::NUM_SLOTS); ++i) {
+        const auto sg = getSlotGridInfo(i);
+        std::int64_t off = 0;
+        // Only honour the slot's grid when it has a real recording or is live —
+        // matches the filter in getSessionStartInBeats so the two are consistent.
+        const bool has_file = last_recordings_[i] != juce::File{};
+        const bool is_live  = recording_active_[i].load(std::memory_order_acquire);
+        if (sg.captured && (has_file || is_live)) {
+            const double offset_sec = (sg.start_in_beats - session_start) * 60.0 / gi.bpm;
+            off = static_cast<std::int64_t>(std::round(offset_sec * sr));
+            if (off < 0) off = 0;
+        }
+        playback_.setSlotOffsetSamples(i, off);
+    }
+}
+
+void HubProcessor::refreshPlaybackSources() {
+    playback_.clearAll();
+    for (std::size_t i = 0; i < last_recordings_.size(); ++i) {
+        const auto& f = last_recordings_[i];
+        if (f != juce::File{} && f.existsAsFile()) {
+            playback_.setSourceForSlot(static_cast<int>(i), f);
+        }
+    }
+}
+
+juce::File HubProcessor::getLastRecordingForSlot(int slot) const noexcept {
+    if (slot < 0 || slot >= static_cast<int>(last_recordings_.size())) return {};
+    return last_recordings_[slot];
+}
+void HubProcessor::setLastRecordingForSlot(int slot, juce::File f) noexcept {
+    if (slot < 0 || slot >= static_cast<int>(last_recordings_.size())) return;
+    last_recordings_[slot] = f;
+}
+
+bool HubProcessor::isNormalizing() const noexcept {
+    return normalizer_ && normalizer_->inProgress();
+}
+
+std::vector<OfflineNormalizer::Result> HubProcessor::lastNormalizationResults() const {
+    if (!normalizer_) return {};
+    return normalizer_->results();
+}
+
+void HubProcessor::startCalibration() {
+    if (region_ == nullptr || !is_hub_)          return;
+    if (calibration_in_progress_)                return;
+
+    // Unique non-zero session id.
+    calibration_session_ = static_cast<std::uint64_t>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    if (calibration_session_ == 0) calibration_session_ = 1;
+
+    // Publish session id BEFORE flipping the active flag so any sat that observes
+    // `calibration_active = 1` is guaranteed to also see the new session id.
+    region_->header.calibration_session_id.store(calibration_session_, std::memory_order_release);
+    region_->header.calibration_active.store(1, std::memory_order_release);
+
+    calibration_started_at_   = std::chrono::steady_clock::now();
+    calibration_in_progress_  = true;
+    last_calibration_result_  = {};
+    last_calibration_result_.summary = "Calibrating...";
+}
+
+void HubProcessor::finishCalibrationIfReady() {
+    if (!calibration_in_progress_) return;
+
+    using namespace std::chrono;
+    const auto elapsed = duration_cast<milliseconds>(steady_clock::now() - calibration_started_at_).count();
+    if (elapsed < kCalibrationWindowMs) return;
+
+    // End the session.
+    region_->header.calibration_active.store(0, std::memory_order_release);
+
+    // Gather responses.
+    struct Resp {
+        int           slot;
+        std::uint64_t hub_hb_at_ack;
+        std::uint64_t wp_at_ack;
+    };
+    std::vector<Resp> resp;
+    for (std::uint32_t i = 0; i < NUM_SLOTS; ++i) {
+        const auto& slot = region_->slots[i];
+        if (slot.state.load(std::memory_order_acquire) != SLOT_STATE_ACTIVE) continue;
+        const auto acked = slot.cal_session_acked.load(std::memory_order_acquire);
+        if (acked != calibration_session_) continue;
+        Resp r;
+        r.slot           = static_cast<int>(i);
+        r.hub_hb_at_ack  = slot.cal_start_hub_heartbeat.load(std::memory_order_relaxed);
+        r.wp_at_ack      = slot.cal_start_wp.load(std::memory_order_relaxed);
+        resp.push_back(r);
+    }
+
+    CalibrationResult R;
+    R.valid = true;
+
+    if (resp.empty()) {
+        R.passed  = false;
+        R.summary = "No satellites responded";
+        R.detail  = "Either no sats are active, transport is stopped, or the host is "
+                    "not delivering processBlock callbacks to any satellite during the "
+                    "calibration window. Press play and try again.";
+    } else if (resp.size() == 1) {
+        R.passed  = true;
+        R.summary = "Single satellite — no inter-sat comparison possible";
+        char buf[160];
+        std::snprintf(buf, sizeof(buf),
+                      "Slot %d responded at hub_hb=%llu. Add a second satellite to "
+                      "verify inter-sat alignment.",
+                      resp[0].slot,
+                      static_cast<unsigned long long>(resp[0].hub_hb_at_ack));
+        R.detail = buf;
+    } else {
+        std::uint64_t min_hb = resp.front().hub_hb_at_ack;
+        std::uint64_t max_hb = resp.front().hub_hb_at_ack;
+        int           min_slot = resp.front().slot;
+        int           max_slot = resp.front().slot;
+        for (const auto& r : resp) {
+            if (r.hub_hb_at_ack < min_hb) { min_hb = r.hub_hb_at_ack; min_slot = r.slot; }
+            if (r.hub_hb_at_ack > max_hb) { max_hb = r.hub_hb_at_ack; max_slot = r.slot; }
+        }
+        const auto offset_callbacks = static_cast<int>(max_hb - min_hb);
+        const auto offset_samples   = static_cast<std::int64_t>(offset_callbacks)
+                                    * static_cast<std::int64_t>(maxBlockSize());
+        R.inter_sat_offset_callbacks = offset_callbacks;
+        R.inter_sat_offset_samples   = offset_samples;
+
+        if (offset_callbacks == 0) {
+            R.passed  = true;
+            R.summary = "Callback-level alignment confirmed";
+            char buf[160];
+            std::snprintf(buf, sizeof(buf),
+                          "All %zu satellites detected the calibration session in the "
+                          "same hub callback (hub_hb=%llu).",
+                          resp.size(),
+                          static_cast<unsigned long long>(min_hb));
+            R.detail = buf;
+        } else {
+            R.passed  = false;
+            R.summary = "Callback-level misalignment detected";
+            char buf[320];
+            std::snprintf(buf, sizeof(buf),
+                          "Slot %d detected calibration at hub_hb=%llu, slot %d at hub_hb=%llu. "
+                          "Inter-sat offset: %d hub callback%s (~%lld samples). "
+                          "Move the hub onto a parent group/bus track so all satellites "
+                          "are upstream of it.",
+                          max_slot, static_cast<unsigned long long>(max_hb),
+                          min_slot, static_cast<unsigned long long>(min_hb),
+                          offset_callbacks, offset_callbacks == 1 ? "" : "s",
+                          static_cast<long long>(offset_samples));
+            R.detail = buf;
+        }
+
+        // Audio-content cross-correlation. Catches sample-level offsets that the
+        // callback-level check misses (e.g., parallel-topology sub-block jitter).
+        //
+        // We deliberately read from (wp_now - N - safety) rather than from
+        // cal_start_wp. The cal_start_wp data may have been overwritten by sat's
+        // overrun policy if the calibration window plus polling latency exceeds the
+        // ring capacity (~170ms at 48k). Reading from the recent tail is always safe
+        // and still gives a same-Reaper-time slice across sats because both wp's
+        // advance in lockstep when sats are aligned.
+        constexpr int N = 4096;        // ~85ms at 48k — well within ring capacity
+        constexpr int K = 1024;        // search range; covers ±2 blocks at 512 frames
+        constexpr float kSignalThreshold = 0.5f;  // normalized corr above this = trust
+        constexpr double kSilenceRms     = 1e-5;  // RMS below this = effectively silent
+
+        const auto safety_margin = static_cast<std::uint64_t>(maxBlockSize()) + 64;
+
+        std::vector<std::vector<float>> mono(resp.size());
+        std::vector<float> interleaved(static_cast<std::size_t>(N) * RING_CHANNELS);
+        bool all_captured = true;
+        for (std::size_t i = 0; i < resp.size(); ++i) {
+            auto& slot = region_->slots[resp[i].slot];
+            SpscRingBuffer rb(slot.ring_header, slot.ring_data, RING_FRAMES, RING_CHANNELS);
+            const auto wp_now = rb.writePos();
+            if (wp_now < static_cast<std::uint64_t>(N) + safety_margin) {
+                all_captured = false;  // not enough audio yet
+                break;
+            }
+            const auto pos = wp_now - static_cast<std::uint64_t>(N) - safety_margin;
+            if (!rb.peekAt(pos, interleaved.data(), N)) {
+                all_captured = false;
+                break;
+            }
+            mono[i].resize(N);
+            for (int j = 0; j < N; ++j) {
+                mono[i][j] = 0.5f * (interleaved[j * 2 + 0] + interleaved[j * 2 + 1]);
+            }
+        }
+
+        if (!all_captured) {
+            R.detail = R.detail + " — Audio probe: could not capture ring data "
+                       "(ring may have been overrun or not yet have enough samples).";
+        }
+
+        if (all_captured) {
+            // Precompute energy (and RMS for display) for each captured signal.
+            std::vector<double> norm(resp.size(), 0.0);
+            std::vector<double> rms (resp.size(), 0.0);
+            for (std::size_t i = 0; i < resp.size(); ++i) {
+                double s = 0.0;
+                for (float x : mono[i]) s += static_cast<double>(x) * x;
+                norm[i] = std::sqrt(s);
+                rms[i]  = std::sqrt(s / static_cast<double>(N));
+            }
+
+            std::string audio_line;
+            for (std::size_t i = 0; i < resp.size(); ++i) {
+                char buf[64];
+                std::snprintf(buf, sizeof(buf), " slot%d:rms=%.4f",
+                              resp[i].slot, rms[i]);
+                audio_line += buf;
+            }
+
+            const auto& a      = mono[0];
+            const double norm_a = norm[0];
+
+            int    worst_offset     = 0;
+            double worst_corr       = 0.0;
+            bool   any_silent       = (rms[0] < kSilenceRms);
+            bool   any_uncorrelated = false;
+
+            for (std::size_t i = 1; i < resp.size(); ++i) {
+                const auto& b      = mono[i];
+                const double norm_b = norm[i];
+
+                if (rms[0] < kSilenceRms || rms[i] < kSilenceRms) {
+                    any_silent = true;
+                    continue;
+                }
+
+                double max_abs_corr = 0.0;
+                int    best_k       = 0;
+                double best_signed  = 0.0;
+                for (int k = -K; k <= K; ++k) {
+                    double sum = 0.0;
+                    const int j0 = std::max(0, -k);
+                    const int j1 = std::min(N, N - k);
+                    for (int j = j0; j < j1; ++j) {
+                        sum += static_cast<double>(a[j]) * static_cast<double>(b[j + k]);
+                    }
+                    const double absSum = std::abs(sum);
+                    if (absSum > max_abs_corr) {
+                        max_abs_corr = absSum;
+                        best_k       = k;
+                        best_signed  = sum;
+                    }
+                }
+
+                const double normalized = max_abs_corr / (norm_a * norm_b);
+                const char   pol = (best_signed < 0) ? '-' : '+';
+                char buf[96];
+                std::snprintf(buf, sizeof(buf),
+                              " %d↔%d:%+d@%c%.2f",
+                              resp[0].slot, resp[i].slot, best_k, pol, normalized);
+                audio_line += buf;
+
+                if (normalized < kSignalThreshold) {
+                    any_uncorrelated = true;
+                } else if (std::abs(best_k) > std::abs(worst_offset)) {
+                    worst_offset = best_k;
+                    worst_corr   = normalized;
+                }
+            }
+
+            // Compose the audio-correlation verdict.
+            std::string audio_verdict;
+            if (any_silent) {
+                audio_verdict = "Audio probe: at least one slot was silent — "
+                                "cross-correlation skipped for it. "
+                                "Play audio in the host while running calibration.";
+            } else if (any_uncorrelated) {
+                audio_verdict = "Audio probe: low correlation — sats are receiving "
+                                "different content. Sample-level offset not "
+                                "measurable. (For sample-accurate verification, "
+                                "feed the same audio to both sat tracks, e.g. via "
+                                "the polarity-null test setup.)";
+            } else if (worst_offset == 0) {
+                audio_verdict = "Audio probe: ring content is aligned in aggregate "
+                                "(0-sample offset across an 85ms window).";
+                // If callback-level disagreed (saw a hub_hb difference), flag the
+                // parallel-topology race: audio averages out fine over a long
+                // window but per-block reads still race, causing block-rate
+                // artifacts in the null test.
+                if (R.inter_sat_offset_callbacks != 0) {
+                    audio_verdict += " HOWEVER: the callback-level probe found a "
+                                     "within-callback ordering offset. The two "
+                                     "checks disagree because the audio probe "
+                                     "averages over a window, while hub's per-block "
+                                     "reads happen one block at a time and race "
+                                     "against satellite writes each callback. Audible "
+                                     "symptom: block-rate artifacts in null test even "
+                                     "though gross alignment looks fine. FIX: move the "
+                                     "hub to a parent group/bus track so all "
+                                     "satellites are processed BEFORE the hub each "
+                                     "callback (eliminates the race).";
+                }
+            } else {
+                R.passed                   = false;
+                R.inter_sat_offset_samples = worst_offset;
+                R.summary                  = "Audio-level sub-block offset detected";
+                char buf[256];
+                std::snprintf(buf, sizeof(buf),
+                              "Inter-sat audio offset: %d samples (correlation %.2f). "
+                              "Parallel-topology sub-block jitter — move the hub to "
+                              "a parent group/bus track for sample-accurate alignment.",
+                              worst_offset, worst_corr);
+                audio_verdict = buf;
+            }
+
+            R.detail = R.detail + " — " + audio_verdict +
+                       (audio_line.empty() ? "" : "  [pairs:" + audio_line + " ]");
+        }
+    }
+
+    last_calibration_result_ = R;
+    calibration_in_progress_ = false;
+}
+
+juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter() {
+    return new HubProcessor();
+}

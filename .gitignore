@@ -1,0 +1,24 @@
+# Build output
+build/
+build-*/
+cmake-build-*/
+
+# macOS
+.DS_Store
+
+# Object files / binaries
+*.o
+*.a
+*.so
+*.dylib
+*.dSYM/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.cache/
+
+# Claude working files
+.claude/
