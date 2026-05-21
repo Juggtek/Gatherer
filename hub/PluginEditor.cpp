@@ -37,6 +37,19 @@ HubEditor::HubEditor(HubProcessor& p)
     };
     addAndMakeVisible(include_input_toggle_);
 
+    pad_silence_toggle_.setTooltip(
+        "ON (default): each recorded WAV starts at the DAW play position, with "
+        "leading silence padded for sats whose host gates processBlock by clip "
+        "presence (e.g. Bitwig). All lanes' x=0 line up with the DAW transport.\n\n"
+        "OFF: each WAV starts at its sat's actual first written sample. Tighter "
+        "files but lanes anchor to whenever each sat began producing audio.");
+    pad_silence_toggle_.setToggleState(processor_.isPadSilenceInRecord(),
+                                        juce::dontSendNotification);
+    pad_silence_toggle_.onClick = [this] {
+        processor_.setPadSilenceInRecord(pad_silence_toggle_.getToggleState());
+    };
+    addAndMakeVisible(pad_silence_toggle_);
+
     master_record_button_.setColour(juce::TextButton::buttonColourId,
                                      juce::Colours::black.withAlpha(0.4f));
     master_record_button_.setColour(juce::TextButton::textColourOffId,
@@ -355,7 +368,10 @@ void HubEditor::resized() {
         opt_row.removeFromLeft(4);
         redo_button_.setBounds(opt_row.removeFromLeft(56).reduced(0, 1));
         opt_row.removeFromLeft(12);
-        include_input_toggle_.setBounds(opt_row);
+        // Split the leftover space between the two toggles.
+        const int toggle_w = opt_row.getWidth() / 2;
+        include_input_toggle_.setBounds(opt_row.removeFromLeft(toggle_w));
+        pad_silence_toggle_  .setBounds(opt_row);
     }
     area.removeFromTop(6);
 

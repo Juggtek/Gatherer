@@ -21,7 +21,8 @@ public:
                 const juce::File& output_file,
                 double sample_rate,
                 std::uint64_t start_wp,
-                juce::AudioThumbnail* thumbnail = nullptr);
+                juce::AudioThumbnail* thumbnail = nullptr,
+                std::atomic<std::uint64_t>* expected_samples = nullptr);
     ~LayerWriter() override;
 
     // Opens the output file. The recording start position (sat.write_pos at
@@ -44,6 +45,7 @@ private:
     void run() override;
     void drainChunk(std::uint32_t frames, std::vector<float>& interleaved,
                     juce::AudioBuffer<float>& planar);
+    void writeSilence(std::uint32_t frames, juce::AudioBuffer<float>& planar);
 
     int                                       slot_;
     gatherer::protocol::SharedRegion*         region_;
@@ -53,5 +55,6 @@ private:
     std::uint64_t                             start_wp_       = 0;
     std::uint64_t                             read_pos_       = 0;
     std::atomic<std::uint64_t>                samples_written_ { 0 };
+    std::atomic<std::uint64_t>*               expected_samples_ = nullptr;  // optional padding sink
     std::unique_ptr<juce::AudioFormatWriter>  writer_;
 };

@@ -16,7 +16,8 @@ LayerWriter::LayerWriter(int slot,
                          const juce::File& file,
                          double sr,
                          std::uint64_t start_wp,
-                         juce::AudioThumbnail* thumbnail)
+                         juce::AudioThumbnail* thumbnail,
+                         std::atomic<std::uint64_t>* expected_samples)
     : juce::Thread("Gatherer LayerWriter " + juce::String(slot))
     , slot_(slot)
     , region_(region)
@@ -24,7 +25,8 @@ LayerWriter::LayerWriter(int slot,
     , sample_rate_(sr)
     , thumbnail_(thumbnail)
     , start_wp_(start_wp)
-    , read_pos_(start_wp) {}
+    , read_pos_(start_wp)
+    , expected_samples_(expected_samples) {}
 
 LayerWriter::~LayerWriter() {
     stopAndFinalize();
@@ -69,6 +71,18 @@ void LayerWriter::stopAndFinalize() {
     writer_.reset();  // closes file
 }
 
+void LayerWriter::writeSilence(std::uint32_t frames,
+                                juce::AudioBuffer<float>& planar) {
+    planar.clear(0, static_cast<int>(frames));
+    writer_->writeFromAudioSampleBuffer(planar, 0, static_cast<int>(frames));
+    if (thumbnail_ != nullptr) {
+        const auto sample_offset =
+            static_cast<juce::int64>(samples_written_.load(std::memory_order_relaxed));
+        thumbnail_->addBlock(sample_offset, planar, 0, static_cast<int>(frames));
+    }
+    samples_written_.fetch_add(frames, std::memory_order_relaxed);
+}
+
 void LayerWriter::drainChunk(std::uint32_t frames,
                               std::vector<float>& interleaved,
                               juce::AudioBuffer<float>& planar) {
@@ -109,12 +123,40 @@ void LayerWriter::run() {
                                             * RING_CHANNELS);
 
     while (!threadShouldExit()) {
-        const auto wp = rb.writePos();
-        if (wp >= read_pos_ + kChunkFrames) {
+        const auto wp        = rb.writePos();
+        const auto real_avail = (wp > read_pos_) ? (wp - read_pos_) : 0ull;
+
+        // Prefer real audio when we have at least a full chunk.
+        if (real_avail >= kChunkFrames) {
             drainChunk(kChunkFrames, interleaved, planar);
-        } else {
-            wait(kWaitMs);
+            continue;
         }
+
+        // Pad silence to catch up to the audio thread's expected count when
+        // the toggle wired us an expected_samples_ pointer. Sat tracks that
+        // some hosts gate on clip presence won't produce data continuously;
+        // padding keeps the WAV's timeline locked to play-start.
+        if (expected_samples_ != nullptr) {
+            const auto expected = expected_samples_->load(std::memory_order_acquire);
+            const auto written  = samples_written_.load(std::memory_order_relaxed);
+            const auto behind   = (expected > written) ? (expected - written) : 0ull;
+
+            if (behind > 0) {
+                if (real_avail > 0) {
+                    // Drain whatever real samples there are before padding.
+                    const auto take = static_cast<std::uint32_t>(
+                        std::min<std::uint64_t>(real_avail, behind));
+                    drainChunk(take, interleaved, planar);
+                } else {
+                    const auto pad = static_cast<std::uint32_t>(
+                        std::min<std::uint64_t>(behind, kChunkFrames));
+                    writeSilence(pad, planar);
+                }
+                continue;
+            }
+        }
+
+        wait(kWaitMs);
     }
 
     // Drain remaining samples up to current wp.

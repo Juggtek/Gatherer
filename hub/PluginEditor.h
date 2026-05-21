@@ -28,6 +28,7 @@ private:
     juce::Label       title_;
     juce::Label       status_;
     juce::ToggleButton include_input_toggle_ { "Include track input as source" };
+    juce::ToggleButton pad_silence_toggle_   { "Pad silence in recording" };
 
     juce::TextButton  master_record_button_ { "● Record" };
     juce::Label       record_status_;

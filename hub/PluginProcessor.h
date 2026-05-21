@@ -216,6 +216,24 @@ public:
     bool isIncludeTrackInput()  const noexcept { return include_track_input_.load(std::memory_order_relaxed); }
     void setIncludeTrackInput(bool v) noexcept { include_track_input_.store(v, std::memory_order_relaxed); }
 
+    // Silence-padding toggle for recordings. When ON, every armed slot's WAV
+    // begins at session play-start, with leading zeros for any sat that
+    // didn't write yet (some hosts gate processBlock by clip presence — e.g.
+    // Bitwig). When OFF, each WAV begins at its sat's actual first-write
+    // moment so the file is tight (no silence overhead). The toggle is read
+    // at record-start time and applied to that whole take.
+    bool isPadSilenceInRecord()  const noexcept { return pad_silence_in_record_.load(std::memory_order_relaxed); }
+    void setPadSilenceInRecord(bool v) noexcept { pad_silence_in_record_.store(v, std::memory_order_relaxed); }
+
+    // Audio-thread per-slot counter: incremented by `frames` each processBlock
+    // while a slot is recording_active and transport is playing. Writers read
+    // this to know how much silence (if any) to pad when their sat ring isn't
+    // producing samples but the DAW transport is rolling.
+    std::atomic<std::uint64_t>* expectedSamplesPtr(int slot) noexcept {
+        if (slot < 0 || slot >= static_cast<int>(expected_samples_.size())) return nullptr;
+        return &expected_samples_[slot];
+    }
+
     // True when this AudioProcessor is being hosted by JUCE's standalone wrapper
     // (`Gatherer Hub.app`) rather than a DAW. Editors use it to choose deployment-
     // specific defaults / UI hints.
@@ -320,8 +338,11 @@ private:
 
     // Deployment-aware parameter. Default depends on wrapperType (see constructor).
     std::atomic<bool> include_track_input_{ false };
+    std::atomic<bool> pad_silence_in_record_{ true };
 
     std::atomic<float> target_lufs_{ -14.0f };
+
+    std::array<std::atomic<std::uint64_t>, gatherer::protocol::NUM_SLOTS> expected_samples_{};
 
     // Calibration probe state. Started by startCalibration(), finalized when the
     // editor's timer notices enough time has passed.

@@ -207,6 +207,7 @@ void HubProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuff
                                     .load(std::memory_order_acquire);
                 recording_start_wp_[i].store(wp, std::memory_order_release);
                 recording_active_  [i].store(true, std::memory_order_release);
+                expected_samples_  [i].store(0, std::memory_order_release);
                 grid_.per_slot[i].captured.store(false, std::memory_order_release);
             }
             juce::MessageManager::callAsync([this] {
@@ -253,30 +254,41 @@ void HubProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuff
                     const double block_dur_s   = (sr > 0.0) ? (frames / sr) : 0.0;
                     const double block_dur_b   = block_dur_s * grid_.bpm / 60.0;
 
-                    // Per-slot — but only once this slot's sat has actually
-                    // written something. Some hosts (Bitwig) gate processBlock
-                    // by clip presence: a non-input-armed track's sat won't
-                    // write until its clip starts playing. If we captured at
-                    // delta == 0, the slot would claim sample 0 = play start
-                    // even though the WAV's sample 0 corresponds to clip start
-                    // — the rendered lane would misalign by exactly that gap.
-                    // Waiting for delta > 0 anchors start_in_beats to the
-                    // first DAW frame the sat actually wrote.
+                    // Per-slot capture + expected-samples accounting.
+                    //
+                    // When pad-silence is ON (default), all armed slots
+                    // capture immediately on the snapshot block so every
+                    // slot's start_in_beats == play-start; the writer pads
+                    // zeros for any sat whose clip-gated host hasn't kicked
+                    // off processBlock yet, so the WAV's sample 0 also lives
+                    // at play-start. When OFF we wait for delta > 0 so the
+                    // anchor is "first DAW frame this sat actually wrote"
+                    // — produces tighter files but lanes won't share x=0.
+                    //
+                    // expected_samples_[i] grows by `frames` every active
+                    // block regardless of toggle — the writer only consults
+                    // it when pad-silence is ON, so OFF mode pays nothing.
+                    const bool pad = pad_silence_in_record_.load(std::memory_order_relaxed);
                     for (std::uint32_t i = 0; i < NUM_SLOTS; ++i) {
                         if (!recording_active_[i].load(std::memory_order_acquire)) continue;
+                        if (region_->slots[i].state.load(std::memory_order_acquire) != SLOT_STATE_ACTIVE) continue;
+
+                        expected_samples_[i].fetch_add(static_cast<std::uint64_t>(frames),
+                                                       std::memory_order_release);
+
                         auto& ps = grid_.per_slot[i];
                         if (ps.captured.load(std::memory_order_acquire)) continue;
-                        if (region_->slots[i].state.load(std::memory_order_acquire) != SLOT_STATE_ACTIVE) continue;
 
                         const auto start_wp = recording_start_wp_[i].load(std::memory_order_acquire);
                         const auto sat_wp   = region_->slots[i].ring_header.write_pos
                                                   .load(std::memory_order_acquire);
                         const std::int64_t delta = static_cast<std::int64_t>(sat_wp)
                                                  - static_cast<std::int64_t>(start_wp);
-                        if (delta <= 0) continue;  // sat hasn't written yet
+                        if (!pad && delta <= 0) continue;  // pad-off: wait for first write
 
+                        const std::int64_t delta_for_calc = (delta > 0) ? delta : 0;
                         const double delta_s = (sr > 0.0)
-                            ? static_cast<double>(delta) / sr : 0.0;
+                            ? static_cast<double>(delta_for_calc) / sr : 0.0;
                         const double delta_b = delta_s * grid_.bpm / 60.0;
 
                         ps.start_in_seconds.store(now_seconds + block_dur_s - delta_s,
@@ -427,6 +439,8 @@ void HubProcessor::getStateInformation(juce::MemoryBlock& destData) {
                      include_track_input_.load(std::memory_order_relaxed), nullptr);
     tree.setProperty("target_lufs",
                      target_lufs_.load(std::memory_order_relaxed), nullptr);
+    tree.setProperty("pad_silence_in_record",
+                     pad_silence_in_record_.load(std::memory_order_relaxed), nullptr);
     tree.setProperty("session_folder", session_.serializeForPluginState(), nullptr);
 
     juce::ValueTree mix("mix");
@@ -470,6 +484,10 @@ void HubProcessor::setStateInformation(const void* data, int sizeInBytes) {
     if (tree.hasProperty("target_lufs")) {
         target_lufs_.store(static_cast<float>(static_cast<double>(tree["target_lufs"])),
                            std::memory_order_relaxed);
+    }
+    if (tree.hasProperty("pad_silence_in_record")) {
+        pad_silence_in_record_.store(static_cast<bool>(tree["pad_silence_in_record"]),
+                                      std::memory_order_relaxed);
     }
     if (tree.hasProperty("session_folder")) {
         session_.restoreFromPluginState(tree["session_folder"].toString());
@@ -708,16 +726,18 @@ bool HubProcessor::actuallyStartRecording() {
     // Audio thread has already populated recording_active_ and
     // recording_start_wp_ for every slot that was armed at the moment of
     // play-detection. Just turn that into an ArmedLayer list.
+    const bool pad = pad_silence_in_record_.load(std::memory_order_relaxed);
     std::vector<Recorder::ArmedLayer> armed;
     for (std::uint32_t i = 0; i < NUM_SLOTS; ++i) {
         if (!recording_active_[i].load(std::memory_order_acquire)) continue;
         if (region_->slots[i].state.load(std::memory_order_acquire) != SLOT_STATE_ACTIVE) continue;
         Recorder::ArmedLayer a;
-        a.slot         = static_cast<int>(i);
-        a.track_name   = juce::String::fromUTF8(region_->slots[i].track_name);
-        a.display_name = juce::String::fromUTF8(region_->slots[i].display_name);
-        a.thumbnail    = thumbnails_[i].get();
-        a.start_wp     = recording_start_wp_[i].load(std::memory_order_acquire);
+        a.slot             = static_cast<int>(i);
+        a.track_name       = juce::String::fromUTF8(region_->slots[i].track_name);
+        a.display_name     = juce::String::fromUTF8(region_->slots[i].display_name);
+        a.thumbnail        = thumbnails_[i].get();
+        a.start_wp         = recording_start_wp_[i].load(std::memory_order_acquire);
+        a.expected_samples = pad ? &expected_samples_[i] : nullptr;
         armed.push_back(a);
     }
     if (armed.empty()) return false;

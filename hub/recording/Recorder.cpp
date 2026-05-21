@@ -32,7 +32,7 @@ bool Recorder::start(const std::vector<ArmedLayer>& armed, double sample_rate,
         auto file   = session_folder_.getChildFile(file_name);
         auto writer = std::make_unique<LayerWriter>(a.slot, region_, file,
                                                       sample_rate, a.start_wp,
-                                                      a.thumbnail);
+                                                      a.thumbnail, a.expected_samples);
         if (!writer->prepare()) {
             // Skip this layer if its writer can't be set up.
             continue;

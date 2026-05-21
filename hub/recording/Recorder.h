@@ -20,14 +20,19 @@ public:
     ~Recorder();
 
     struct ArmedLayer {
-        int                   slot;
-        juce::String          track_name;
-        juce::String          display_name;
-        juce::AudioThumbnail* thumbnail = nullptr;  // optional; if non-null, fed live
+        int                          slot;
+        juce::String                 track_name;
+        juce::String                 display_name;
+        juce::AudioThumbnail*        thumbnail = nullptr;  // optional; if non-null, fed live
         // sat.write_pos snapshot taken by the caller right before start(); used
         // as the writer's first-sample position so it agrees byte-accurately
         // with the hub's grid-capture reference (no writer-side re-snapshot).
-        std::uint64_t         start_wp = 0;
+        std::uint64_t                start_wp = 0;
+        // Optional: audio-thread counter of "samples we should have written by
+        // now if keeping up with DAW transport". When non-null AND the user has
+        // silence padding enabled, the writer pads zeros to catch up whenever
+        // the sat ring isn't producing data.
+        std::atomic<std::uint64_t>*  expected_samples = nullptr;
     };
 
     // Returns true on success. False if already recording, no slots armed,
