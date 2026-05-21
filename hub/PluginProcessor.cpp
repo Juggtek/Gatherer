@@ -81,6 +81,13 @@ HubProcessor::HubProcessor()
 }
 
 HubProcessor::~HubProcessor() {
+    // Stop the LUFS worker first — it reads sat rings via region_, so it
+    // must be torn down before detachFromShm clears the region pointer.
+    if (lufs_worker_) {
+        lufs_worker_->signalThreadShouldExit();
+        lufs_worker_->stopThread(1000);
+        lufs_worker_.reset();
+    }
     // Stop any in-flight recording before detaching from the shared region —
     // the writer threads read the satellite rings via region_ pointers.
     if (recorder_) recorder_->stop();
@@ -133,13 +140,22 @@ void HubProcessor::prepareToPlay(double sampleRate, int samplesPerBlock) {
     max_block_size_ = samplesPerBlock;
     scratch_.assign(static_cast<std::size_t>(samplesPerBlock) * RING_CHANNELS, 0.0f);
 
+    // Stop the worker before touching its analyzers — restart afterwards.
+    if (lufs_worker_) {
+        lufs_worker_->signalThreadShouldExit();
+        lufs_worker_->stopThread(1000);
+        lufs_worker_.reset();
+    }
     for (auto& sl : lufs_) {
         sl.analyzer = std::make_unique<gatherer::measurement::LoudnessAnalyzer>(2, sampleRate);
         sl.integrated .store(-100.0f, std::memory_order_relaxed);
         sl.momentary  .store(-100.0f, std::memory_order_relaxed);
         sl.short_term .store(-100.0f, std::memory_order_relaxed);
+        sl.last_fed_wp   = 0;
         sl.query_counter = 0;
     }
+    lufs_worker_ = std::make_unique<LufsWorker>(*this);
+    lufs_worker_->startThread();
 
     playback_.prepare(sampleRate, samplesPerBlock);
 
@@ -156,7 +172,93 @@ void HubProcessor::prepareToPlay(double sampleRate, int samplesPerBlock) {
     }
 }
 
-void HubProcessor::releaseResources() {}
+void HubProcessor::releaseResources() {
+    if (lufs_worker_) {
+        lufs_worker_->signalThreadShouldExit();
+        lufs_worker_->stopThread(1000);
+        lufs_worker_.reset();
+    }
+}
+
+void HubProcessor::LufsWorker::run() {
+    while (!threadShouldExit()) {
+        processor_.lufsWorkerTick();
+        wait(50);  // ~20Hz poll — plenty for LUFS metering
+    }
+}
+
+void HubProcessor::lufsWorkerTick() {
+    if (region_ == nullptr) return;
+
+    // Read up to ~40ms of audio per tick at typical 48k. Ring capacity is
+    // ~170ms so we'll never overrun even with the 50ms poll interval.
+    constexpr std::uint32_t kChunkFrames = 2048;
+    static thread_local std::vector<float> chunk;
+    if (chunk.size() < static_cast<std::size_t>(kChunkFrames) * RING_CHANNELS) {
+        chunk.resize(static_cast<std::size_t>(kChunkFrames) * RING_CHANNELS);
+    }
+
+    for (std::uint32_t i = 0; i < NUM_SLOTS; ++i) {
+        const auto& sat = region_->slots[i];
+        if (sat.state.load(std::memory_order_acquire) != SLOT_STATE_ACTIVE) continue;
+
+        auto& sl = lufs_[i];
+        if (!sl.analyzer) continue;
+
+        // Detect "new sat occupies this slot" (e.g. ghost reclaim then a fresh
+        // claim, or first sat ever in this slot). Reset analyzer + anchor so
+        // we don't bleed loudness history across sat lifetimes.
+        const auto uuid = sat.sat_uuid.load(std::memory_order_acquire);
+        if (uuid != sl.last_seen_uuid) {
+            sl.analyzer->reset();
+            sl.last_fed_wp    = 0;
+            sl.last_seen_uuid = uuid;
+            sl.query_counter  = 0;
+            sl.integrated.store(-100.0f, std::memory_order_relaxed);
+            sl.momentary .store(-100.0f, std::memory_order_relaxed);
+            sl.short_term.store(-100.0f, std::memory_order_relaxed);
+        }
+
+        SpscRingBuffer rb(const_cast<SpscRingBuffer::Header&>(sat.ring_header),
+                           const_cast<float*>(sat.ring_data),
+                           RING_FRAMES, RING_CHANNELS);
+        const auto wp_now = rb.writePos();
+
+        // On first observation of a slot, anchor at its current wp — we don't
+        // care about pre-attach audio.
+        if (sl.last_fed_wp == 0) {
+            sl.last_fed_wp = wp_now;
+        }
+
+        // Feed any new samples since last tick (in chunks).
+        while (wp_now > sl.last_fed_wp) {
+            const auto avail = wp_now - sl.last_fed_wp;
+            const auto take  = static_cast<std::uint32_t>(
+                std::min<std::uint64_t>(avail, kChunkFrames));
+            if (!rb.peekAt(sl.last_fed_wp, chunk.data(), take)) {
+                // Overrun — resync to current wp.
+                sl.last_fed_wp = wp_now;
+                break;
+            }
+            sl.analyzer->addInterleavedFloat(chunk.data(), take);
+            sl.last_fed_wp += take;
+        }
+
+        // Query LUFS at ~4Hz (5 ticks × 50ms).
+        if (++sl.query_counter >= 5) {
+            sl.query_counter = 0;
+            sl.integrated.store(
+                static_cast<float>(sl.analyzer->integratedLufs()),
+                std::memory_order_relaxed);
+            sl.momentary.store(
+                static_cast<float>(sl.analyzer->momentaryLufs()),
+                std::memory_order_relaxed);
+            sl.short_term.store(
+                static_cast<float>(sl.analyzer->shortTermLufs()),
+                std::memory_order_relaxed);
+        }
+    }
+}
 
 bool HubProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const {
     return layouts.getMainOutputChannelSet() == juce::AudioChannelSet::stereo()
@@ -357,26 +459,8 @@ void HubProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuff
                            static_cast<std::uint32_t>(frames))) continue;
         }
 
-        // LUFS metering — pre-fader, same signal as peak/RMS metering.
-        {
-            auto& sl = lufs_[s];
-            if (sl.analyzer) {
-                sl.analyzer->addInterleavedFloat(scratch_.data(),
-                                                 static_cast<std::size_t>(frames));
-                if (++sl.query_counter >= 10) {
-                    sl.query_counter = 0;
-                    sl.integrated.store(
-                        static_cast<float>(sl.analyzer->integratedLufs()),
-                        std::memory_order_relaxed);
-                    sl.momentary.store(
-                        static_cast<float>(sl.analyzer->momentaryLufs()),
-                        std::memory_order_relaxed);
-                    sl.short_term.store(
-                        static_cast<float>(sl.analyzer->shortTermLufs()),
-                        std::memory_order_relaxed);
-                }
-            }
-        }
+        // (LUFS feeding/querying now lives on the LufsWorker thread — see
+        // lufsWorkerTick. The audio thread no longer touches the analyzer.)
 
         // Mix gating: a slot contributes to the master mix unless it's muted,
         // or another slot is soloed and this one isn't.
@@ -573,7 +657,9 @@ void HubProcessor::reclaimGhostSlots() {
         lvl.peak_lin_r.store(0.0f, std::memory_order_relaxed);
         lvl.rms_lin_l .store(0.0f, std::memory_order_relaxed);
         lvl.rms_lin_r .store(0.0f, std::memory_order_relaxed);
-        if (lufs_[i].analyzer) lufs_[i].analyzer->reset();
+        // LUFS state: only touch the atomics here (worker-thread state stays
+        // worker-owned). The worker detects the UUID transition on its next
+        // tick and resets its analyzer + last_fed_wp itself.
         lufs_[i].integrated.store(-100.0f, std::memory_order_relaxed);
         lufs_[i].momentary .store(-100.0f, std::memory_order_relaxed);
         lufs_[i].short_term.store(-100.0f, std::memory_order_relaxed);

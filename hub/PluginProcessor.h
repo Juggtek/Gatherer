@@ -416,13 +416,37 @@ private:
     bool actuallyStartRecording();
 
     // Per-slot EBU R128 loudness state. Analyzer is (re)created in prepareToPlay;
-    // atomics are written by the audio thread and read by the GUI thread.
+    // results are read by the GUI thread atomically.
+    //
+    // **Owned exclusively by the lufs worker thread** — not the audio thread.
+    // libebur128's per-block processing (and especially `loudness_global`) is
+    // O(history) and at small DAW buffer sizes (e.g. Bitwig's 80-sample blocks)
+    // routinely blows the audio deadline. We do the feed + query on a
+    // dedicated background thread, which reads each sat's ring directly via
+    // peekAt and publishes results through atomic stores for the GUI.
     struct SlotLufs {
         std::unique_ptr<gatherer::measurement::LoudnessAnalyzer> analyzer;
         std::atomic<float> integrated  { -100.0f };
         std::atomic<float> momentary   { -100.0f };
         std::atomic<float> short_term  { -100.0f };
-        int                query_counter = 0;
+        // Worker-thread-only state (no atomics needed — single-thread access).
+        std::uint64_t      last_fed_wp    = 0;
+        std::uint64_t      last_seen_uuid = 0;  // detects slot turnover
+        int                query_counter  = 0;
     };
     std::array<SlotLufs, gatherer::protocol::NUM_SLOTS> lufs_{};
+
+    // Worker thread that feeds the per-slot LoudnessAnalyzers and queries them
+    // at a sub-100Hz cadence. Created in prepareToPlay so we know the host's
+    // sample rate; torn down on releaseResources and destruction.
+    class LufsWorker : public juce::Thread {
+    public:
+        explicit LufsWorker(HubProcessor& p)
+            : juce::Thread("GathererLufs"), processor_(p) {}
+        void run() override;
+    private:
+        HubProcessor& processor_;
+    };
+    std::unique_ptr<LufsWorker> lufs_worker_;
+    void lufsWorkerTick();
 };

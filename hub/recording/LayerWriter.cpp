@@ -159,14 +159,38 @@ void LayerWriter::run() {
         wait(kWaitMs);
     }
 
-    // Drain remaining samples up to current wp.
+    // Determine the target length once — `expected_samples` is frozen now that
+    // recording_active has gone false and the audio thread no longer increments it.
+    const std::uint64_t target =
+        (expected_samples_ != nullptr)
+            ? expected_samples_->load(std::memory_order_acquire)
+            : std::numeric_limits<std::uint64_t>::max();
+
+    // Drain remaining real samples up to the target (or until sat stops).
     while (true) {
+        const auto written = samples_written_.load(std::memory_order_relaxed);
+        if (written >= target) break;
         const auto wp    = rb.writePos();
         const auto avail = (wp > read_pos_) ? (wp - read_pos_) : 0ull;
         if (avail == 0) break;
         const auto take = static_cast<std::uint32_t>(
-            std::min<std::uint64_t>(avail, kChunkFrames));
+            std::min<std::uint64_t>({avail, target - written,
+                                     static_cast<std::uint64_t>(kChunkFrames)}));
         drainChunk(take, interleaved, planar);
         if (rb.writePos() == read_pos_) break;  // peekAt failed, abort drain
+    }
+
+    // Pad silence to the target so every armed slot's WAV ends at the same
+    // session-relative sample position. Without this, slots whose sat stopped
+    // writing before stopRecording end up shorter than slots that kept going.
+    if (expected_samples_ != nullptr) {
+        while (true) {
+            const auto written = samples_written_.load(std::memory_order_relaxed);
+            if (written >= target) break;
+            const auto pad = static_cast<std::uint32_t>(
+                std::min<std::uint64_t>(target - written,
+                                         static_cast<std::uint64_t>(kChunkFrames)));
+            writeSilence(pad, planar);
+        }
     }
 }
