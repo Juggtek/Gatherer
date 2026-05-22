@@ -444,32 +444,45 @@ void HubProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuff
     // hands it to us — by which point the DAW has already applied PDC across
     // every child track. That makes it a sample-accurate reference for
     // "music at master time T". Push a mono-summed copy into the ref ring
-    // before we touch the buffer, so the calibrator can correlate each sat
-    // against it.
+    // before we touch the buffer.
+    //
+    // Critical: write to the ref ring ONLY when transport is playing, and
+    // anchor wp=0 to the master frame at the first playing block. This
+    // makes (hub_anchor + hub_wp) == master frame at the latest written
+    // sample, which the cross-correlator relies on to find sat content
+    // in hub's ring. If we wrote on every callback regardless of playing
+    // state, hub_wp would track wall-clock callbacks rather than master
+    // time, and any data written while transport was stopped would push
+    // the corresponding hub window past the ref ring's capacity.
     if (!pdc_ref_data_.empty() && frames > 0) {
-        const auto* L = buffer.getReadPointer(0);
-        const auto* R = buffer.getNumChannels() > 1 ? buffer.getReadPointer(1) : L;
-        const auto cap  = static_cast<std::uint32_t>(pdc_ref_data_.size());
-        const auto mask = cap - 1u;
-        const auto wp_before = pdc_ref_header_.write_pos.load(std::memory_order_relaxed);
-        for (int i = 0; i < frames; ++i) {
-            const auto idx = static_cast<std::uint32_t>((wp_before + static_cast<std::uint64_t>(i)) & mask);
-            pdc_ref_data_[idx] = 0.5f * (L[i] + R[i]);
-        }
-        pdc_ref_header_.write_pos.store(wp_before + static_cast<std::uint64_t>(frames),
-                                         std::memory_order_release);
-
-        // First-time anchor: master frame at the start of this block. Lets
-        // the calibrator translate ref-ring wp positions back to master time
-        // when comparing to sat anchors.
-        if (!pdc_ref_anchor_set_.load(std::memory_order_relaxed)) {
-            if (auto* ph = getPlayHead()) {
-                if (auto pos = ph->getPosition()) {
-                    if (auto t = pos->getTimeInSamples()) {
-                        pdc_ref_anchor_host_frame_.store(*t, std::memory_order_relaxed);
-                        pdc_ref_anchor_set_.store(true, std::memory_order_release);
-                    }
+        bool playing_now = false;
+        std::int64_t hfs_at_block_start = 0;
+        bool have_hfs = false;
+        if (auto* ph = getPlayHead()) {
+            if (auto pos = ph->getPosition()) {
+                playing_now = pos->getIsPlaying();
+                if (auto t = pos->getTimeInSamples()) {
+                    hfs_at_block_start = *t;
+                    have_hfs = true;
                 }
+            }
+        }
+        if (playing_now && have_hfs) {
+            const auto* L = buffer.getReadPointer(0);
+            const auto* R = buffer.getNumChannels() > 1 ? buffer.getReadPointer(1) : L;
+            const auto cap  = static_cast<std::uint32_t>(pdc_ref_data_.size());
+            const auto mask = cap - 1u;
+            const auto wp_before = pdc_ref_header_.write_pos.load(std::memory_order_relaxed);
+            for (int i = 0; i < frames; ++i) {
+                const auto idx = static_cast<std::uint32_t>((wp_before + static_cast<std::uint64_t>(i)) & mask);
+                pdc_ref_data_[idx] = 0.5f * (L[i] + R[i]);
+            }
+            pdc_ref_header_.write_pos.store(wp_before + static_cast<std::uint64_t>(frames),
+                                             std::memory_order_release);
+
+            if (!pdc_ref_anchor_set_.load(std::memory_order_relaxed)) {
+                pdc_ref_anchor_host_frame_.store(hfs_at_block_start, std::memory_order_relaxed);
+                pdc_ref_anchor_set_.store(true, std::memory_order_release);
             }
         }
     }
