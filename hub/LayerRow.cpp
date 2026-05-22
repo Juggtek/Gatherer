@@ -9,7 +9,7 @@ namespace {
 // NORM is the LUFS-normalization gain stage, separate from the user fader so
 // the upcoming Adaptive Mixer can drive the fader without fighting
 // normalization. M/S are gates applied after both gain stages.
-constexpr int kMoveColumnWidth = 18;
+constexpr int kMoveColumnWidth = 20;
 constexpr int kColorTagWidth   = 5;
 constexpr int kInfoAreaWidth   = 130;
 constexpr int kButtonSize      = 22;
@@ -138,18 +138,12 @@ LayerRow::LayerRow() {
     };
     addAndMakeVisible(gain_slider_);
 
-    auto setupMoveButton = [this](juce::TextButton& b, const juce::String& tip) {
-        b.setColour(juce::TextButton::buttonColourId,
-                    juce::Colours::black.withAlpha(0.35f));
-        b.setColour(juce::TextButton::textColourOffId,
-                    juce::Colours::white.withAlpha(0.7f));
-        b.setTooltip(tip);
-        addAndMakeVisible(b);
-    };
-    setupMoveButton(move_up_button_,   "Move this layer up in the display order.");
-    setupMoveButton(move_down_button_, "Move this layer down in the display order.");
+    move_up_button_  .setTooltip("Move this layer up in the display order.");
+    move_down_button_.setTooltip("Move this layer down in the display order.");
     move_up_button_  .onClick = [this] { if (onMoveUp)   onMoveUp();   };
     move_down_button_.onClick = [this] { if (onMoveDown) onMoveDown(); };
+    addAndMakeVisible(move_up_button_);
+    addAndMakeVisible(move_down_button_);
 
     lane_.onDeleteRecording = [this] { if (onDeleteRecording) onDeleteRecording(); };
     lane_.onSeekFraction    = [this](double f) {
@@ -400,6 +394,38 @@ juce::Rectangle<int> LayerRow::laneArea() const {
     auto bounds = getLocalBounds();
     bounds.removeFromLeft(kStripFixedWidth);
     return bounds.reduced(2, 2);
+}
+
+void LayerRow::ArrowButton::paintButton(juce::Graphics& g, bool over, bool down) {
+    auto bounds = getLocalBounds().toFloat();
+
+    const auto bg_alpha = isEnabled()
+        ? (down ? 0.55f : (over ? 0.45f : 0.32f))
+        : 0.15f;
+    g.setColour(juce::Colours::black.withAlpha(bg_alpha));
+    g.fillRoundedRectangle(bounds, 2.0f);
+
+    const float cx     = bounds.getCentreX();
+    const float cy     = bounds.getCentreY();
+    const float side   = std::min(bounds.getWidth(), bounds.getHeight()) * 0.55f;
+    const float half_w = side * 0.5f;
+    const float half_h = side * 0.45f;
+
+    juce::Path tri;
+    if (up_) {
+        tri.startNewSubPath(cx,          cy - half_h);
+        tri.lineTo         (cx - half_w, cy + half_h);
+        tri.lineTo         (cx + half_w, cy + half_h);
+    } else {
+        tri.startNewSubPath(cx,          cy + half_h);
+        tri.lineTo         (cx - half_w, cy - half_h);
+        tri.lineTo         (cx + half_w, cy - half_h);
+    }
+    tri.closeSubPath();
+
+    g.setColour(isEnabled() ? juce::Colours::white
+                              : juce::Colours::white.withAlpha(0.3f));
+    g.fillPath(tri);
 }
 
 float LayerRow::dbToFraction(float db) const {

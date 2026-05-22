@@ -660,7 +660,33 @@ void HubProcessor::moveSlotInDisplayOrder(int slot, int direction) noexcept {
     if (pos < 0) return;
     const int new_pos = pos + direction;
     if (new_pos < 0 || new_pos >= static_cast<int>(display_order_.size())) return;
+    const int other_slot = display_order_[new_pos];
     std::swap(display_order_[pos], display_order_[new_pos]);
+
+    // Position-bound mix params (mute / solo / volume gain) swap between the
+    // two slots so each visual row keeps the values that lived at its position
+    // before the reorder. Per-sat params (norm gain, target LUFS, record arm)
+    // stay with the slot — they belong to the audio source, not the row.
+    if (slot < 0 || slot >= static_cast<int>(mix_.size())) return;
+    if (other_slot < 0 || other_slot >= static_cast<int>(mix_.size())) return;
+    auto& a = mix_[slot];
+    auto& b = mix_[other_slot];
+
+    const auto swap_bool = [](std::atomic<bool>& x, std::atomic<bool>& y) {
+        const bool xv = x.load(std::memory_order_relaxed);
+        const bool yv = y.load(std::memory_order_relaxed);
+        x.store(yv, std::memory_order_relaxed);
+        y.store(xv, std::memory_order_relaxed);
+    };
+    const auto swap_float = [](std::atomic<float>& x, std::atomic<float>& y) {
+        const float xv = x.load(std::memory_order_relaxed);
+        const float yv = y.load(std::memory_order_relaxed);
+        x.store(yv, std::memory_order_relaxed);
+        y.store(xv, std::memory_order_relaxed);
+    };
+    swap_bool (a.mute,     b.mute);
+    swap_bool (a.solo,     b.solo);
+    swap_float(a.gain_lin, b.gain_lin);
 }
 
 std::vector<HubProcessor::SatelliteSnapshot> HubProcessor::snapshotSatellites() const {

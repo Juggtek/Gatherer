@@ -78,8 +78,19 @@ private:
     juce::TextButton    solo_button_      { "S" };
     juce::TextButton    record_button_    { "R" };
     juce::TextButton    normalize_button_ { "N" };
-    juce::TextButton    move_up_button_   { "^" };
-    juce::TextButton    move_down_button_ { "v" };
+
+    // Custom up/down triangle buttons — clearer than text "^" / "v" at the
+    // small column width the reorder controls live in.
+    class ArrowButton : public juce::Button {
+    public:
+        ArrowButton(const juce::String& name, bool points_up)
+            : juce::Button(name), up_(points_up) {}
+        void paintButton(juce::Graphics& g, bool over, bool down) override;
+    private:
+        bool up_;
+    };
+    ArrowButton move_up_button_   { "move_up",   true  };
+    ArrowButton move_down_button_ { "move_down", false };
     juce::Label         norm_target_label_;   // editable: per-slot target LUFS
     juce::Label         norm_db_label_;       // readonly: current normalize gain in dB
     juce::Slider        gain_slider_;
