@@ -652,6 +652,12 @@ void HubEditor::timerCallback() {
                     std::make_unique<gatherer::undo::DeleteRecordingCommand>(
                         processor_, slot_idx, wav));
             };
+            row_ptr->onMoveUp   = [this, slot_idx] {
+                processor_.moveSlotInDisplayOrder(slot_idx, -1);
+            };
+            row_ptr->onMoveDown = [this, slot_idx] {
+                processor_.moveSlotInDisplayOrder(slot_idx, +1);
+            };
             // New row → inherit the current global target if the per-slot target
             // is still at its default. (State-restore paths preserve whatever
             // was saved.)
@@ -720,19 +726,40 @@ void HubEditor::timerCallback() {
         if (active_now[i]) ++count_now;
     }
 
-    // Re-layout only when the set of visible rows changed. At 30Hz this avoids
-    // pointless setBounds() calls each tick.
-    if (count_now != last_layout_count_) {
-        last_layout_count_ = count_now;
+    // Walk display_order, collect visible slots in display order. Re-layout
+    // whenever count *or* order changes — both are user-driven (sat
+    // connect/disconnect, or move up/down click).
+    const auto order = processor_.getDisplayOrder();
+    std::array<int, gatherer::protocol::NUM_SLOTS> visible_seq{};
+    std::size_t visible_count = 0;
+    for (int slot : order) {
+        if (slot >= 0 && slot < static_cast<int>(active_now.size())
+            && active_now[static_cast<std::size_t>(slot)]) {
+            visible_seq[visible_count++] = slot;
+        }
+    }
+
+    const bool layout_changed =
+        visible_count != last_layout_count_
+        || !std::equal(visible_seq.begin(), visible_seq.begin() + visible_count,
+                        last_layout_order_.begin());
+    if (layout_changed) {
+        last_layout_count_ = visible_count;
+        std::copy(visible_seq.begin(), visible_seq.begin() + visible_count,
+                   last_layout_order_.begin());
 
         constexpr int kRowHeight = 56;
         constexpr int kRowGap    = 4;
 
         const auto bounds = layers_container_.getLocalBounds();
         int y = bounds.getY();
-        for (std::size_t i = 0; i < rows_.size(); ++i) {
-            if (!active_now[i] || !rows_[i]) continue;
-            rows_[i]->setBounds(bounds.getX(), y, bounds.getWidth(), kRowHeight);
+        for (std::size_t i = 0; i < visible_count; ++i) {
+            const int slot = visible_seq[i];
+            auto& r = rows_[static_cast<std::size_t>(slot)];
+            if (!r) continue;
+            r->setBounds(bounds.getX(), y, bounds.getWidth(), kRowHeight);
+            r->setMoveUpEnabled  (i > 0);
+            r->setMoveDownEnabled(i + 1 < visible_count);
             y += kRowHeight + kRowGap;
         }
     }

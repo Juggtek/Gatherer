@@ -2,11 +2,14 @@
 
 namespace {
 // Strip is laid out left-to-right in signal-flow order:
-//   [color][info][R][NORM: target + N + dB][VOL][M][S][meters][readout]
+//   [move ↑/↓][color][info][R][NORM: target + N + dB][VOL][M][S][meters][readout]
 //
-// R is the record-arm tap (pre-fader). NORM is the LUFS-normalization gain stage,
-// separate from the user fader so the upcoming Adaptive Mixer can drive the fader
-// without fighting normalization. M/S are gates applied after both gain stages.
+// The move column is a small reorder handle (up + down stacked) so the user
+// can permute layers in display order. R is the record-arm tap (pre-fader).
+// NORM is the LUFS-normalization gain stage, separate from the user fader so
+// the upcoming Adaptive Mixer can drive the fader without fighting
+// normalization. M/S are gates applied after both gain stages.
+constexpr int kMoveColumnWidth = 18;
 constexpr int kColorTagWidth   = 5;
 constexpr int kInfoAreaWidth   = 130;
 constexpr int kButtonSize      = 22;
@@ -26,7 +29,8 @@ constexpr int kMeterBarGap     = 2;
 constexpr int kReadoutWidth    = 80;
 constexpr int kStripPadRight   = 8;
 
-constexpr int kStripFixedWidth = kColorTagWidth + kInfoAreaWidth + kSectionGap
+constexpr int kStripFixedWidth = kMoveColumnWidth
+                                + kColorTagWidth + kInfoAreaWidth + kSectionGap
                                 + kButtonSize + kSectionGap
                                 + kNormAreaWidth + kSectionGap
                                 + kFaderWidth + kSectionGap
@@ -134,6 +138,19 @@ LayerRow::LayerRow() {
     };
     addAndMakeVisible(gain_slider_);
 
+    auto setupMoveButton = [this](juce::TextButton& b, const juce::String& tip) {
+        b.setColour(juce::TextButton::buttonColourId,
+                    juce::Colours::black.withAlpha(0.35f));
+        b.setColour(juce::TextButton::textColourOffId,
+                    juce::Colours::white.withAlpha(0.7f));
+        b.setTooltip(tip);
+        addAndMakeVisible(b);
+    };
+    setupMoveButton(move_up_button_,   "Move this layer up in the display order.");
+    setupMoveButton(move_down_button_, "Move this layer down in the display order.");
+    move_up_button_  .onClick = [this] { if (onMoveUp)   onMoveUp();   };
+    move_down_button_.onClick = [this] { if (onMoveDown) onMoveDown(); };
+
     lane_.onDeleteRecording = [this] { if (onDeleteRecording) onDeleteRecording(); };
     lane_.onSeekFraction    = [this](double f) {
         if (onSeekSeconds && session_seconds_ > 0.0) {
@@ -220,7 +237,8 @@ void LayerRow::paint(juce::Graphics& g) {
     g.fillRoundedRectangle(strip.toFloat(), 3.0f);
 
     g.setColour(color_);
-    g.fillRect(strip.getX(), strip.getY(), kColorTagWidth, strip.getHeight());
+    g.fillRect(strip.getX() + kMoveColumnWidth, strip.getY(),
+               kColorTagWidth, strip.getHeight());
 
     auto drawBar = [&](const juce::Rectangle<int>& meter,
                        float peak_db, float rms_db) {
@@ -286,6 +304,16 @@ void LayerRow::paint(juce::Graphics& g) {
 
 void LayerRow::resized() {
     auto strip = stripArea();
+
+    // Move column — small up/down buttons stacked vertically.
+    {
+        auto move_col = strip.removeFromLeft(kMoveColumnWidth);
+        const int btn_h = move_col.getHeight() / 2 - 1;
+        move_up_button_  .setBounds(move_col.removeFromTop(btn_h).reduced(1));
+        move_col.removeFromTop(2);
+        move_down_button_.setBounds(move_col.removeFromTop(btn_h).reduced(1));
+    }
+
     strip.removeFromLeft(kColorTagWidth);
 
     // Info
@@ -345,7 +373,8 @@ juce::Rectangle<int> LayerRow::stripArea() const {
 juce::Rectangle<int> LayerRow::meterAreaL() const {
     auto strip = stripArea();
     // Skip everything up to (and including) the S button + its trailing gap.
-    const int meters_x = strip.getX() + kColorTagWidth + kInfoAreaWidth + kSectionGap
+    const int meters_x = strip.getX() + kMoveColumnWidth
+                       + kColorTagWidth + kInfoAreaWidth + kSectionGap
                        + kButtonSize + kSectionGap
                        + kNormAreaWidth + kSectionGap
                        + kFaderWidth + kSectionGap

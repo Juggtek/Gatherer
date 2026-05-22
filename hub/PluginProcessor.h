@@ -279,6 +279,20 @@ public:
     };
     std::vector<SatelliteSnapshot> snapshotSatellites() const;
 
+    // Display ordering — independent of SHM slot index. display_order_[i] is
+    // the slot_index shown at display position i. Defaults to identity; the
+    // user can permute via the up/down buttons on each LayerRow. Persisted in
+    // plugin state + session manifest so re-routings survive reloads.
+    //
+    // The Adaptive Mixer will later key its rules off display position rather
+    // than raw slot index so the user's spatial arrangement of layers carries
+    // semantic weight (e.g. "topmost layer is bus / submix").
+    std::array<int, gatherer::protocol::NUM_SLOTS> getDisplayOrder() const noexcept;
+    void setDisplayOrder(const std::array<int, gatherer::protocol::NUM_SLOTS>& order) noexcept;
+    // Move a slot one position up (-1) or down (+1) in display order; clamps
+    // to the array bounds and silently no-ops at the edges.
+    void moveSlotInDisplayOrder(int slot, int direction) noexcept;
+
     // Scan ACTIVE slots and forcibly reclaim any whose owning process is no
     // longer alive (PID-liveness check). Called explicitly: once on hub attach
     // to clean up stale slots left over from prior DAW processes, and on the
@@ -407,6 +421,17 @@ private:
     // block we get a chance to read the playhead on. delta = sat.wp_now − start_wp.
     std::array<std::atomic<bool>,          gatherer::protocol::NUM_SLOTS> recording_active_{};
     std::array<std::atomic<std::uint64_t>, gatherer::protocol::NUM_SLOTS> recording_start_wp_{};
+
+    // Display-order permutation. display_order_[i] = slot_index at position i.
+    // Only touched by the message thread (UI / manifest I/O).
+    //
+    // TODO (post-Adaptive-Mixer phase): fix the 1-block recording offset by
+    // tracking prev_sat_wp_ at the end of each processBlock and using that as
+    // the snapshot anchor at the rising edge of armed+playing. In pad-ON mode
+    // also capture per-slot start_in_beats at snapshot time (start_in_beats =
+    // now_beats directly) since the delta-based formula yields F_block_end for
+    // delta==0 slots, which is one block too late.
+    std::array<int, gatherer::protocol::NUM_SLOTS> display_order_{};
 
     // Armed-but-not-yet-recording state. startRecording (message thread) only
     // flips `armed_pending_`; the audio thread does the actual sat.wp

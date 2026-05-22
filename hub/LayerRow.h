@@ -61,6 +61,12 @@ public:
     std::function<void(float)> onTargetLufsChanged;
     std::function<void()>      onDeleteRecording;
     std::function<void(double)> onSeekSeconds;
+    std::function<void()>      onMoveUp;
+    std::function<void()>      onMoveDown;
+
+    // Disable up/down buttons at the top/bottom of the display order.
+    void setMoveUpEnabled(bool e)   { move_up_button_  .setEnabled(e); }
+    void setMoveDownEnabled(bool e) { move_down_button_.setEnabled(e); }
 
     void paint(juce::Graphics&) override;
     void resized() override;
@@ -72,6 +78,8 @@ private:
     juce::TextButton    solo_button_      { "S" };
     juce::TextButton    record_button_    { "R" };
     juce::TextButton    normalize_button_ { "N" };
+    juce::TextButton    move_up_button_   { "^" };
+    juce::TextButton    move_down_button_ { "v" };
     juce::Label         norm_target_label_;   // editable: per-slot target LUFS
     juce::Label         norm_db_label_;       // readonly: current normalize gain in dB
     juce::Slider        gain_slider_;

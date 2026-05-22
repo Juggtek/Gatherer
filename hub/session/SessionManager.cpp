@@ -144,6 +144,10 @@ juce::var SessionManager::buildManifestVar() const {
     global->setProperty("include_track_input", processor_.isIncludeTrackInput());
     root->setProperty("global", juce::var(global));
 
+    juce::Array<juce::var> order_arr;
+    for (int v : processor_.getDisplayOrder()) order_arr.add(v);
+    root->setProperty("display_order", order_arr);
+
     if (const auto g = processor_.getCurrentGridInfo(); g.captured) {
         auto* grid = new juce::DynamicObject();
         grid->setProperty("bpm",              g.bpm);
@@ -205,6 +209,15 @@ bool SessionManager::applyManifestVar(const juce::var& v) {
         if (global.hasProperty("include_track_input")) {
             processor_.setIncludeTrackInput(static_cast<bool>(global["include_track_input"]));
         }
+    }
+
+    if (auto order = v["display_order"]; order.isArray()
+        && static_cast<std::size_t>(order.size()) == gatherer::protocol::NUM_SLOTS) {
+        std::array<int, gatherer::protocol::NUM_SLOTS> arr{};
+        for (int i = 0; i < static_cast<int>(arr.size()); ++i) {
+            arr[static_cast<std::size_t>(i)] = static_cast<int>(order[i]);
+        }
+        processor_.setDisplayOrder(arr);
     }
 
     if (auto grid = v["grid"]; grid.isObject()) {

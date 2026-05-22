@@ -58,6 +58,9 @@ HubProcessor::HubProcessor()
         .withOutput("Output", juce::AudioChannelSet::stereo(), true)),
       session_(*this)
 {
+    for (std::size_t i = 0; i < display_order_.size(); ++i)
+        display_order_[i] = static_cast<int>(i);
+
     my_uuid_ = generateInstanceId();
     // Standalone defaults to summing system-audio input with the sat mix (otherwise
     // the standalone has no use for its audio device input). In-DAW VST3 defaults to
@@ -527,6 +530,13 @@ void HubProcessor::getStateInformation(juce::MemoryBlock& destData) {
                      pad_silence_in_record_.load(std::memory_order_relaxed), nullptr);
     tree.setProperty("session_folder", session_.serializeForPluginState(), nullptr);
 
+    juce::String display_order_str;
+    for (std::size_t i = 0; i < display_order_.size(); ++i) {
+        if (i > 0) display_order_str += ',';
+        display_order_str += juce::String(display_order_[i]);
+    }
+    tree.setProperty("display_order", display_order_str, nullptr);
+
     juce::ValueTree mix("mix");
     for (std::size_t i = 0; i < mix_.size(); ++i) {
         juce::ValueTree slot("slot");
@@ -576,6 +586,18 @@ void HubProcessor::setStateInformation(const void* data, int sizeInBytes) {
     if (tree.hasProperty("session_folder")) {
         session_.restoreFromPluginState(tree["session_folder"].toString());
     }
+    if (tree.hasProperty("display_order")) {
+        const auto raw = tree["display_order"].toString();
+        juce::StringArray parts;
+        parts.addTokens(raw, ",", "");
+        std::array<int, gatherer::protocol::NUM_SLOTS> order{};
+        if (parts.size() == static_cast<int>(order.size())) {
+            for (int i = 0; i < parts.size(); ++i) {
+                order[static_cast<std::size_t>(i)] = parts[i].getIntValue();
+            }
+            setDisplayOrder(order);
+        }
+    }
 
     auto mix = tree.getChildWithName("mix");
     if (mix.isValid()) {
@@ -612,6 +634,33 @@ int HubProcessor::activeSatellites() const noexcept {
         if (slot.state.load(std::memory_order_acquire) == SLOT_STATE_ACTIVE) ++n;
     }
     return n;
+}
+
+std::array<int, gatherer::protocol::NUM_SLOTS> HubProcessor::getDisplayOrder() const noexcept {
+    return display_order_;
+}
+
+void HubProcessor::setDisplayOrder(const std::array<int, gatherer::protocol::NUM_SLOTS>& order) noexcept {
+    // Validate: every slot index 0..N-1 must appear exactly once.
+    std::array<bool, gatherer::protocol::NUM_SLOTS> seen{};
+    for (int v : order) {
+        if (v < 0 || v >= static_cast<int>(gatherer::protocol::NUM_SLOTS)) return;
+        if (seen[static_cast<std::size_t>(v)]) return;
+        seen[static_cast<std::size_t>(v)] = true;
+    }
+    display_order_ = order;
+}
+
+void HubProcessor::moveSlotInDisplayOrder(int slot, int direction) noexcept {
+    if (direction != -1 && direction != 1) return;
+    int pos = -1;
+    for (int i = 0; i < static_cast<int>(display_order_.size()); ++i) {
+        if (display_order_[i] == slot) { pos = i; break; }
+    }
+    if (pos < 0) return;
+    const int new_pos = pos + direction;
+    if (new_pos < 0 || new_pos >= static_cast<int>(display_order_.size())) return;
+    std::swap(display_order_[pos], display_order_[new_pos]);
 }
 
 std::vector<HubProcessor::SatelliteSnapshot> HubProcessor::snapshotSatellites() const {

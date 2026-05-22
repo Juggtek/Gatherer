@@ -70,6 +70,7 @@ private:
     std::array<std::unique_ptr<LayerRow>, gatherer::protocol::NUM_SLOTS> rows_{};
     juce::Component                                                     layers_container_;
     std::size_t                                                         last_layout_count_ = 0;
+    std::array<int, gatherer::protocol::NUM_SLOTS>                      last_layout_order_{};
 
     gatherer::diagnostics::HealthMonitor health_monitor_;
 
