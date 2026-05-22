@@ -122,12 +122,13 @@ void LayerWriter::run() {
     std::vector<float>       interleaved(static_cast<std::size_t>(kChunkFrames)
                                             * RING_CHANNELS);
 
-    // Smaller-than-kChunkFrames pad step so an in-flight pad doesn't swallow
-    // a sat-write that happened during the pad. With kChunkFrames=4096 a sat
-    // that started writing mid-pad would leave a visible ~85ms silence gap
-    // before the audio begins; 256 samples caps that to ~5ms (and the recheck
-    // below usually catches it before any silence at all is committed).
-    constexpr std::uint32_t kPadStep = 256;
+    // Pad step is intentionally tiny (64 frames ~ 1.3ms at 48k) so an in-flight
+    // pad operation can't swallow a sat-write that happened during the pad.
+    // With kChunkFrames=4096 the worst-case over-pad was ~85ms (very visible);
+    // 64 samples caps it to well under a perceptible threshold. The recheck of
+    // sat.wp right before the pad call usually catches the race before any
+    // silence is committed at all.
+    constexpr std::uint32_t kPadStep = 64;
 
     while (!threadShouldExit()) {
         const auto wp        = rb.writePos();
