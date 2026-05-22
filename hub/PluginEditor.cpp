@@ -194,6 +194,13 @@ HubEditor::HubEditor(HubProcessor& p)
                                 juce::Colours::white.withAlpha(0.7f));
     addAndMakeVisible(calibrate_detail_);
 
+    pdc_diag_label_.setText("calibrator: starting...", juce::dontSendNotification);
+    pdc_diag_label_.setFont(juce::FontOptions(11.0f));
+    pdc_diag_label_.setJustificationType(juce::Justification::topLeft);
+    pdc_diag_label_.setColour(juce::Label::textColourId,
+                              juce::Colours::yellow.withAlpha(0.85f));
+    addAndMakeVisible(pdc_diag_label_);
+
     calibrate_button_.setTooltip("Run an active probe: hub posts a calibration session, "
                                  "each sat snapshots (hub_heartbeat, write_pos) when it "
                                  "sees the session, hub compares snapshots. Detects "
@@ -413,6 +420,8 @@ void HubEditor::resized() {
         calibrate_detail_.setBounds(cal_area);
     }
 
+    area.removeFromTop(4);
+    pdc_diag_label_.setBounds(area.removeFromTop(18));
     area.removeFromTop(8);
 
     // Session row.
@@ -476,6 +485,26 @@ void HubEditor::timerCallback() {
                     juce::dontSendNotification);
 
     updateHealth();
+
+    // PDC calibrator diagnostic.
+    {
+        const auto ticks    = processor_.pdcTickCount();
+        const auto succ     = processor_.pdcSuccessCount();
+        juce::String txt = "calibrator: ticks=" + juce::String((long long) ticks)
+                          + " measurements=" + juce::String((long long) succ);
+        // Show per-slot raw measured samples too (whether the publication
+        // succeeded), so we can see what the cross-correlator found.
+        const double sr = processor_.getSampleRate();
+        for (std::uint32_t i = 0; i < gatherer::protocol::NUM_SLOTS; ++i) {
+            const auto d = processor_.pdcDMeasured(static_cast<int>(i));
+            if (d == HubProcessor::kPdcUnknown) continue;
+            const double ms = (sr > 0.0) ? (static_cast<double>(d) / sr) * 1000.0 : 0.0;
+            txt += "  s" + juce::String((int) i) + ":"
+                 + juce::String((long long) d) + " ("
+                 + juce::String(ms, 1) + "ms)";
+        }
+        pdc_diag_label_.setText(txt, juce::dontSendNotification);
+    }
 
     // Master record button state + status text.
     if (processor_.isArmedPending()) {

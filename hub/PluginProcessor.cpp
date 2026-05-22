@@ -306,6 +306,7 @@ void HubProcessor::PdcCalibrator::run() {
 // the cross-correlation IS the per-track pre-roll D — positive means sat's
 // content is `D` samples ahead of what master heard at the same wall-clock.
 void HubProcessor::pdcCalibratorTick() {
+    pdc_tick_count_.fetch_add(1, std::memory_order_relaxed);
     if (region_ == nullptr) return;
     if (!pdc_ref_anchor_set_.load(std::memory_order_acquire)) return;
 
@@ -343,7 +344,7 @@ void HubProcessor::pdcCalibratorTick() {
                           region_->slots[i].ring_data,
                           RING_FRAMES, RING_CHANNELS);
         const auto sat_wp_now = rb.writePos();
-        if (sat_wp_now < static_cast<std::uint64_t>(N + K)) continue;
+        // (sat_wp_now-vs-backshift check is below, after `backshift` is in scope)
 
         // Use last_write_host_frame (master frame at END of sat's most recent
         // processBlock) as the master-time anchor for the sat window. This is
@@ -356,15 +357,18 @@ void HubProcessor::pdcCalibratorTick() {
             region_->slots[i].last_write_host_frame.load(std::memory_order_acquire);
         if (sat_last_master <= 0) continue;  // sat hasn't written yet
 
-        // Read sat's window OFFSET BACK BY K from the most recent samples.
-        // Sat fires before hub each callback (parent-bus order), so sat's
-        // last_write_host_frame is essentially current master time. If we
-        // tried to correlate sat's most-recent N samples, lag k > 0 would
-        // look at hub_wp positions past hub_wp_now — the bytes hub hasn't
-        // written yet — and the peekAt-equivalent would fail. Backshifting
-        // by K means the lag sweep stays inside hub's already-written
-        // range.
-        const auto sat_start = sat_wp_now - static_cast<std::uint64_t>(N + K);
+        // Read sat's window OFFSET BACK BY (K + safety) from the most recent
+        // samples. Sat fires before hub each callback (parent-bus order), so
+        // sat_last_master can be a block ahead of (hub_anchor + hub_wp_now)
+        // in the small window between sat's processBlock and hub's. Without
+        // the extra block of safety, the lag sweep can read past hub's wp
+        // and skip the iteration. With it, we're definitively inside hub's
+        // already-written range.
+        const auto safety = static_cast<std::uint64_t>(maxBlockSize() > 0
+                                                       ? maxBlockSize() : 1024);
+        const auto backshift = static_cast<std::uint64_t>(N + K) + safety;
+        if (sat_wp_now < backshift) continue;
+        const auto sat_start = sat_wp_now - backshift;
         if (!rb.peekAt(sat_start, sat_interleaved.data(), N)) continue;  // overrun
         for (int j = 0; j < N; ++j) {
             sat_mono[static_cast<std::size_t>(j)]
@@ -380,7 +384,8 @@ void HubProcessor::pdcCalibratorTick() {
         // We then sweep lag k in [-K, K]; lag k = D means hub at
         // hub_wp + k matches sat's content (PDC pre-rolled sat by D).
         const std::int64_t baseline_start =
-            static_cast<std::int64_t>(sat_last_master) - N - K - hub_anchor;
+            static_cast<std::int64_t>(sat_last_master) - N - K
+            - static_cast<std::int64_t>(safety) - hub_anchor;
 
         const std::int64_t hub_window_start = baseline_start - K;
         const int hub_window_len = N + 2 * K;
@@ -428,6 +433,7 @@ void HubProcessor::pdcCalibratorTick() {
 
         pdc_d_samples_[i].store(static_cast<std::int64_t>(best_k),
                                  std::memory_order_relaxed);
+        pdc_success_count_.fetch_add(1, std::memory_order_relaxed);
     }
 }
 

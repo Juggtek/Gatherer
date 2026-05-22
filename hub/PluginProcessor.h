@@ -543,6 +543,15 @@ private:
 
     std::array<std::atomic<std::int64_t>, gatherer::protocol::NUM_SLOTS> pdc_d_samples_;
     std::array<std::atomic<std::int64_t>, gatherer::protocol::NUM_SLOTS> pdc_d_override_;
+    // Debug counters — increment per calibrator iteration / per successful
+    // measurement so the UI can show "is the calibrator even alive?".
+    std::atomic<std::uint64_t>                                            pdc_tick_count_       { 0 };
+    std::atomic<std::uint64_t>                                            pdc_success_count_    { 0 };
+
+public:
+    std::uint64_t pdcTickCount()    const noexcept { return pdc_tick_count_.load(std::memory_order_relaxed); }
+    std::uint64_t pdcSuccessCount() const noexcept { return pdc_success_count_.load(std::memory_order_relaxed); }
+private:
 
     class PdcCalibrator : public juce::Thread {
     public:

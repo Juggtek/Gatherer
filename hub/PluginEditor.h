@@ -65,6 +65,11 @@ private:
     juce::Label       calibrate_detail_;
     juce::Colour      calibrate_badge_color_ { juce::Colours::grey };
 
+    // Temporary diagnostic label showing whether the cross-correlation
+    // calibrator is even running and how many measurements it has produced.
+    // Helps debug why per-row "Latency:" stays unmeasured.
+    juce::Label       pdc_diag_label_;
+
     // One row per slot, allocated on demand as sats appear. Hidden when the slot
     // is no longer active. Stacked vertically inside layers_container_.
     std::array<std::unique_ptr<LayerRow>, gatherer::protocol::NUM_SLOTS> rows_{};
