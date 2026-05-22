@@ -191,10 +191,16 @@ public:
     bool        isArmedOrRecording() const noexcept { return isArmedPending() || isRecording(); }
 
     // Explicit "Export Normalized" — renders `*_normalized.wav` siblings for
-    // every loaded recording using the **current per-slot norm_db** (so the
-    // exported file matches the live preview). Returns false if there's
-    // nothing to render. Status is queried via isNormalizing() while it runs.
+    // every loaded recording using the **current per-slot norm_db**, padded to
+    // the session timeline (per-slot offset + trailing silence to the longest
+    // recording's end). The exported files form a sample-aligned stem set
+    // that can be loaded into another DAW and dropped at the project origin.
     bool exportNormalized();
+
+    // Same idea without the normalize gain — produces `*_aligned.wav` stems
+    // whose only difference from the original WAVs is alignment to the
+    // session timeline (offsets + trailing silence).
+    bool exportAligned();
     bool                                       isNormalizing() const noexcept;
     std::vector<OfflineNormalizer::Result>     lastNormalizationResults() const;
 
@@ -284,6 +290,7 @@ public:
 private:
     void attachToShm();
     void detachFromShm();
+    bool launchAlignedExport(bool apply_normalize, const juce::String& suffix);
 
     std::unique_ptr<gatherer::SharedMemory> shm_;
     gatherer::protocol::SharedRegion*       region_ = nullptr;

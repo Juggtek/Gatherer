@@ -113,10 +113,22 @@ HubEditor::HubEditor(HubProcessor& p)
                                          juce::Colours::black.withAlpha(0.4f));
     export_normalized_button_.setColour(juce::TextButton::textColourOffId,
                                          juce::Colours::white);
-    export_normalized_button_.setTooltip("Render *_normalized.wav files using the current "
-                                          "per-layer normalize gain (what you're hearing).");
+    export_normalized_button_.setTooltip("Render *_normalized.wav stems: each slot's audio "
+                                          "with its current normalize gain, padded to the "
+                                          "session timeline (offset + trailing silence) so the "
+                                          "files are sample-aligned across all slots.");
     export_normalized_button_.onClick = [this] { processor_.exportNormalized(); };
     addAndMakeVisible(export_normalized_button_);
+
+    export_aligned_button_.setColour(juce::TextButton::buttonColourId,
+                                      juce::Colours::black.withAlpha(0.4f));
+    export_aligned_button_.setColour(juce::TextButton::textColourOffId,
+                                      juce::Colours::white);
+    export_aligned_button_.setTooltip("Render *_aligned.wav stems: each slot's original audio "
+                                       "(no gain applied), padded to the session timeline so the "
+                                       "files are sample-aligned across all slots.");
+    export_aligned_button_.onClick = [this] { processor_.exportAligned(); };
+    addAndMakeVisible(export_aligned_button_);
     normalize_all_button_.onClick = [this] {
         // Normalize All uses the GLOBAL target (the field next to the button),
         // not per-row targets. Per-row targets remain in effect for the per-row
@@ -356,6 +368,8 @@ void HubEditor::resized() {
         opt_row.removeFromRight(8);
         record_status_.setBounds(opt_row.removeFromRight(220));
         opt_row.removeFromRight(12);
+        export_aligned_button_.setBounds(opt_row.removeFromRight(120).reduced(0, 1));
+        opt_row.removeFromRight(6);
         export_normalized_button_.setBounds(opt_row.removeFromRight(140).reduced(0, 1));
         opt_row.removeFromRight(6);
         normalize_all_button_.setBounds(opt_row.removeFromRight(110).reduced(0, 1));

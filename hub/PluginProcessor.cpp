@@ -867,13 +867,42 @@ void HubProcessor::stopRecording() {
 }
 
 bool HubProcessor::exportNormalized() {
+    return launchAlignedExport(/*apply_normalize=*/true,
+                                /*suffix=*/"_normalized");
+}
+
+bool HubProcessor::exportAligned() {
+    return launchAlignedExport(/*apply_normalize=*/false,
+                                /*suffix=*/"_aligned");
+}
+
+bool HubProcessor::launchAlignedExport(bool apply_normalize, const juce::String& suffix) {
+    // Compute the session timeline span = max(offset + length) across slots
+    // that have a recording on disk.
+    std::int64_t session_length = 0;
+    for (std::size_t i = 0; i < last_recordings_.size(); ++i) {
+        if (last_recordings_[i] == juce::File{} || !last_recordings_[i].existsAsFile()) continue;
+        const auto off = playback_.slotOffsetSamples(static_cast<int>(i));
+        const auto len = playback_.slotLengthSamples(static_cast<int>(i));
+        if (len > 0) session_length = std::max(session_length, off + len);
+    }
+    if (session_length == 0) return false;
+
     std::vector<OfflineNormalizer::Task> tasks;
     for (std::size_t i = 0; i < last_recordings_.size(); ++i) {
         const auto& f = last_recordings_[i];
         if (f == juce::File{} || !f.existsAsFile()) continue;
-        tasks.push_back({f, getNormalizeDb(static_cast<int>(i))});
+
+        OfflineNormalizer::Task t;
+        t.file                  = f;
+        t.gain_db               = apply_normalize ? getNormalizeDb(static_cast<int>(i)) : 0.0f;
+        t.output_suffix         = suffix;
+        t.offset_samples        = playback_.slotOffsetSamples(static_cast<int>(i));
+        t.total_length_samples  = session_length;
+        tasks.push_back(std::move(t));
     }
     if (tasks.empty()) return false;
+
     normalizer_.reset();  // join previous thread if any
     normalizer_ = std::make_unique<OfflineNormalizer>(std::move(tasks));
     normalizer_->startAsync();

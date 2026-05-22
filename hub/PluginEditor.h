@@ -35,8 +35,9 @@ private:
 
     juce::Label       global_target_caption_;
     juce::Label       global_target_label_;       // editable LUFS target (global default)
-    juce::TextButton  normalize_all_button_   { "Normalize All" };
+    juce::TextButton  normalize_all_button_     { "Normalize All" };
     juce::TextButton  export_normalized_button_ { "Export Normalized" };
+    juce::TextButton  export_aligned_button_    { "Export Aligned" };
 
     juce::TextButton  undo_button_ { "Undo" };
     juce::TextButton  redo_button_ { "Redo" };

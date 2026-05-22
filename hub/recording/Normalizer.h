@@ -16,13 +16,21 @@
 class OfflineNormalizer : private juce::Thread {
 public:
     struct Task {
-        juce::File file;
-        float      gain_db = 0.0f;
+        juce::File   file;
+        float        gain_db              = 0.0f;
+        juce::String output_suffix        = "_normalized";  // appended before .wav
+        // Optional session-alignment fields. When total_length_samples > 0 the
+        // output is padded with leading silence of `offset_samples` followed by
+        // the gained source, followed by trailing silence to reach exactly
+        // total_length_samples. When total_length_samples == 0 the output is
+        // the same length as the source (no padding).
+        std::int64_t offset_samples       = 0;
+        std::int64_t total_length_samples = 0;
     };
 
     struct Result {
         juce::File   source;
-        juce::File   normalized;
+        juce::File   output;
         float        gain_applied_db = 0.0f;
         bool         success         = false;
         juce::String error;
