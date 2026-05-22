@@ -122,16 +122,30 @@ void LayerWriter::run() {
     std::vector<float>       interleaved(static_cast<std::size_t>(kChunkFrames)
                                             * RING_CHANNELS);
 
-    // Pad step is intentionally tiny (64 frames ~ 1.3ms at 48k) so an in-flight
-    // pad operation can't swallow a sat-write that happened during the pad.
-    // With kChunkFrames=4096 the worst-case over-pad was ~85ms (very visible);
-    // 64 samples caps it to well under a perceptible threshold. The recheck of
-    // sat.wp right before the pad call usually catches the race before any
-    // silence is committed at all.
     constexpr std::uint32_t kPadStep = 64;
+
+    // Sat-activity tracking. If sat advanced its wp recently, treat any
+    // momentary real_avail==0 as scheduling jitter (one block of callback
+    // variance is normal) and wait for it instead of injecting silence.
+    // Only pad once wp has been stuck long enough that the source clearly
+    // is not producing — which is the only state where alignment-by-pad is
+    // actually correct.
+    //
+    // Without this gate the writer would: drain the audio-onset block,
+    // observe real_avail==0 in the very next iteration (sat hasn't fired
+    // the *next* block yet), and write kPadStep samples of silence into
+    // the file before sat catches up. With pad-on this repeated until the
+    // visible 13–25 ms gap we see right at audio onset on every slot.
+    constexpr int kPadStuckMs = 30;
+    std::uint64_t last_wp_seen     = rb.writePos();
+    auto          last_wp_advance  = juce::Time::getMillisecondCounter();
 
     while (!threadShouldExit()) {
         const auto wp        = rb.writePos();
+        if (wp != last_wp_seen) {
+            last_wp_seen    = wp;
+            last_wp_advance = juce::Time::getMillisecondCounter();
+        }
         const auto real_avail = (wp > read_pos_) ? (wp - read_pos_) : 0ull;
 
         if (expected_samples_ != nullptr) {
@@ -154,18 +168,16 @@ void LayerWriter::run() {
             } else if (take_real > 0) {
                 drainChunk(static_cast<std::uint32_t>(take_real), interleaved, planar);
             } else {
-                // Real audio looked unavailable at the top of this iteration;
-                // re-check sat.wp right before padding so a sat that started
-                // writing in the meantime gets drained instead of silently
-                // overwritten with zeros.
-                const auto wp_recheck   = rb.writePos();
-                const auto real_recheck = (wp_recheck > read_pos_) ? (wp_recheck - read_pos_) : 0ull;
-                if (real_recheck > 0) {
-                    const auto take = static_cast<std::uint32_t>(
-                        std::min<std::uint64_t>({real_recheck, needed,
-                                                  static_cast<std::uint64_t>(kChunkFrames)}));
-                    drainChunk(take, interleaved, planar);
+                const auto stuck_ms = juce::Time::getMillisecondCounter() - last_wp_advance;
+                if (stuck_ms < static_cast<std::uint32_t>(kPadStuckMs)) {
+                    // Sat was advancing recently — this is callback jitter,
+                    // not a silent source. Wait briefly and re-check at the
+                    // top of the loop instead of padding.
+                    wait(2);
                 } else {
+                    // Sat has been stuck long enough that we're confident
+                    // it's a real silent period (e.g. clip-gated track).
+                    // Pad to keep samples_written aligned to expected.
                     const auto pad = static_cast<std::uint32_t>(
                         std::min<std::uint64_t>(needed,
                                                  static_cast<std::uint64_t>(kPadStep)));
