@@ -343,7 +343,7 @@ void HubProcessor::pdcCalibratorTick() {
                           region_->slots[i].ring_data,
                           RING_FRAMES, RING_CHANNELS);
         const auto sat_wp_now = rb.writePos();
-        if (sat_wp_now < static_cast<std::uint64_t>(N)) continue;
+        if (sat_wp_now < static_cast<std::uint64_t>(N + K)) continue;
 
         // Use last_write_host_frame (master frame at END of sat's most recent
         // processBlock) as the master-time anchor for the sat window. This is
@@ -356,24 +356,31 @@ void HubProcessor::pdcCalibratorTick() {
             region_->slots[i].last_write_host_frame.load(std::memory_order_acquire);
         if (sat_last_master <= 0) continue;  // sat hasn't written yet
 
-        const auto sat_start = sat_wp_now - static_cast<std::uint64_t>(N);
+        // Read sat's window OFFSET BACK BY K from the most recent samples.
+        // Sat fires before hub each callback (parent-bus order), so sat's
+        // last_write_host_frame is essentially current master time. If we
+        // tried to correlate sat's most-recent N samples, lag k > 0 would
+        // look at hub_wp positions past hub_wp_now — the bytes hub hasn't
+        // written yet — and the peekAt-equivalent would fail. Backshifting
+        // by K means the lag sweep stays inside hub's already-written
+        // range.
+        const auto sat_start = sat_wp_now - static_cast<std::uint64_t>(N + K);
         if (!rb.peekAt(sat_start, sat_interleaved.data(), N)) continue;  // overrun
         for (int j = 0; j < N; ++j) {
             sat_mono[static_cast<std::size_t>(j)]
                 = 0.5f * (sat_interleaved[j * 2] + sat_interleaved[j * 2 + 1]);
         }
 
-        // Sat's last N samples cover master times [sat_last_master - N, sat_last_master)
-        // — assuming sat fired continuously over those frames. For clip-gated
-        // tracks this holds inside a clip burst (the typical case where audio
-        // is actually present). Hub's audio at hub_wp Y is for master time
-        // (hub_anchor + Y). To match sat's window content at D=0, hub window
-        // starts at hub_wp = (sat_last_master - N) - hub_anchor. For lag k=D,
-        // hub window starts D samples later (sat content for master T appears
-        // in hub at hub_wp such that the SAME music is at hub_wp - D, because
-        // sat's content is pre-rolled D ahead by the DAW's PDC).
+        // Sat's selected window covers master times
+        //   [sat_last_master - N - K, sat_last_master - K)
+        // (assuming sat fired continuously over those frames). Hub's audio
+        // at hub_wp Y is for master time (hub_anchor + Y). To match sat's
+        // window content at D=0, hub window starts at the same master time:
+        //   hub_wp = (sat_last_master - N - K) - hub_anchor
+        // We then sweep lag k in [-K, K]; lag k = D means hub at
+        // hub_wp + k matches sat's content (PDC pre-rolled sat by D).
         const std::int64_t baseline_start =
-            static_cast<std::int64_t>(sat_last_master) - N - hub_anchor;
+            static_cast<std::int64_t>(sat_last_master) - N - K - hub_anchor;
 
         const std::int64_t hub_window_start = baseline_start - K;
         const int hub_window_len = N + 2 * K;
@@ -412,8 +419,12 @@ void HubProcessor::pdcCalibratorTick() {
         }
         if (norm_hub < kMinEnergy) continue;
 
-        const double normalized = max_abs / std::sqrt(norm_sat * norm_hub);
-        if (normalized < kMinCorrelation) continue;  // ambiguous, skip
+        // Note: skipping the correlation-confidence gate for now — we always
+        // publish the peak lag so the user sees a number even when the peak
+        // is weak. (Re-introduce a confidence filter once the math is known
+        // to be correct.)
+        (void) std::sqrt(norm_sat * norm_hub);
+        (void) max_abs;
 
         pdc_d_samples_[i].store(static_cast<std::int64_t>(best_k),
                                  std::memory_order_relaxed);
