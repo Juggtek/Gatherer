@@ -126,37 +126,41 @@ void LayerWriter::run() {
         const auto wp        = rb.writePos();
         const auto real_avail = (wp > read_pos_) ? (wp - read_pos_) : 0ull;
 
-        // Prefer real audio when we have at least a full chunk.
-        if (real_avail >= kChunkFrames) {
-            drainChunk(kChunkFrames, interleaved, planar);
+        if (expected_samples_ != nullptr) {
+            // Pad-silence ON: samples_written strictly tracks expected — no
+            // writes past it, no shortfall. Once expected freezes (DAW stops
+            // playing), the writer naturally stops, so every armed slot's
+            // WAV ends at the same session-relative sample count regardless
+            // of whether the sat kept getting processBlock past DAW-stop.
+            const auto expected = expected_samples_->load(std::memory_order_acquire);
+            const auto written  = samples_written_.load(std::memory_order_relaxed);
+            if (written >= expected) {
+                wait(kWaitMs);
+                continue;
+            }
+            const auto needed   = expected - written;
+            const auto take_real = std::min<std::uint64_t>(real_avail, needed);
+
+            if (take_real >= static_cast<std::uint64_t>(kChunkFrames)) {
+                drainChunk(kChunkFrames, interleaved, planar);
+            } else if (take_real > 0) {
+                drainChunk(static_cast<std::uint32_t>(take_real), interleaved, planar);
+            } else {
+                const auto pad = static_cast<std::uint32_t>(
+                    std::min<std::uint64_t>(needed,
+                                             static_cast<std::uint64_t>(kChunkFrames)));
+                writeSilence(pad, planar);
+            }
             continue;
         }
 
-        // Pad silence to catch up to the audio thread's expected count when
-        // the toggle wired us an expected_samples_ pointer. Sat tracks that
-        // some hosts gate on clip presence won't produce data continuously;
-        // padding keeps the WAV's timeline locked to play-start.
-        if (expected_samples_ != nullptr) {
-            const auto expected = expected_samples_->load(std::memory_order_acquire);
-            const auto written  = samples_written_.load(std::memory_order_relaxed);
-            const auto behind   = (expected > written) ? (expected - written) : 0ull;
-
-            if (behind > 0) {
-                if (real_avail > 0) {
-                    // Drain whatever real samples there are before padding.
-                    const auto take = static_cast<std::uint32_t>(
-                        std::min<std::uint64_t>(real_avail, behind));
-                    drainChunk(take, interleaved, planar);
-                } else {
-                    const auto pad = static_cast<std::uint32_t>(
-                        std::min<std::uint64_t>(behind, kChunkFrames));
-                    writeSilence(pad, planar);
-                }
-                continue;
-            }
+        // Pad-silence OFF: original behaviour — drain whenever a chunk's
+        // worth is available, otherwise wait.
+        if (real_avail >= kChunkFrames) {
+            drainChunk(kChunkFrames, interleaved, planar);
+        } else {
+            wait(kWaitMs);
         }
-
-        wait(kWaitMs);
     }
 
     // Determine the target length once — `expected_samples` is frozen now that
