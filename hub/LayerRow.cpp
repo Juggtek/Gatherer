@@ -137,15 +137,15 @@ LayerRow::LayerRow() {
     pdc_label_.setColour(juce::Label::backgroundWhenEditingColourId,
                          juce::Colours::black.withAlpha(0.6f));
     pdc_label_.setColour(juce::Label::textWhenEditingColourId, juce::Colours::white);
-    pdc_label_.setText("PDC: —", juce::dontSendNotification);
-    pdc_label_.setTooltip("Per-track PDC offset (ms). Auto-measured by cross-"
+    pdc_label_.setText("Latency: -", juce::dontSendNotification);
+    pdc_label_.setTooltip("Per-track latency offset (ms). Auto-measured by cross-"
                           "correlating this sat's audio against the hub's input. "
                           "Click to edit and override (e.g. if your DAW reports a "
                           "known per-track latency). Type 'auto' or blank to clear.");
     pdc_label_.onTextChange = [this] {
         const auto txt = pdc_label_.getText().trim().toLowerCase();
         if (! onPdcOverrideChanged) { updatePdcLabel(); return; }
-        if (txt.isEmpty() || txt == "auto" || txt == "—") {
+        if (txt.isEmpty() || txt == "auto" || txt == "-") {
             onPdcOverrideChanged(kPdcUnknown);
         } else {
             // Accept "13", "13.0", "13 ms", "13.0ms" — strip non-numeric tail.
@@ -255,12 +255,12 @@ void LayerRow::updatePdcLabel() {
     const bool   has_override = (pdc_override_samples_ != kPdcUnknown);
     const long long shown_samp = has_override ? pdc_override_samples_ : pdc_measured_samples_;
     if (shown_samp == kPdcUnknown || pdc_sample_rate_ <= 0.0) {
-        pdc_label_.setText(has_override ? "PDC: (override blank)" : "PDC: —",
+        pdc_label_.setText(has_override ? "Latency: (override blank)" : "Latency: -",
                             juce::dontSendNotification);
         return;
     }
     const double ms = (static_cast<double>(shown_samp) / pdc_sample_rate_) * 1000.0;
-    juce::String txt = "PDC: " + juce::String(ms, 2) + " ms";
+    juce::String txt = "Latency: " + juce::String(ms, 2) + " ms";
     if (has_override) txt += "  (manual)";
     pdc_label_.setText(txt, juce::dontSendNotification);
 }

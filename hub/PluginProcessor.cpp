@@ -309,9 +309,12 @@ void HubProcessor::pdcCalibratorTick() {
     if (region_ == nullptr) return;
     if (!pdc_ref_anchor_set_.load(std::memory_order_acquire)) return;
 
-    constexpr int N = 4096;  // sat window length (~85ms @ 48k)
-    constexpr int K = 2048;  // ± lag search range (~43ms @ 48k)
-    constexpr double kMinCorrelation = 0.3;
+    constexpr int N = 2048;  // sat window length (~43ms @ 48k) — short enough to fit
+                             // inside one clip-gated burst (typical sampler clip ~ 100ms)
+    constexpr int K = 4096;  // ± lag search range (~85ms @ 48k) — covers typical PDC
+    constexpr double kMinCorrelation = 0.05;  // sat is one component of a mix —
+                                              // expected normalized corr ~= sqrt(sat_energy / mix_energy)
+                                              // which is small in busy mixes
     constexpr double kMinEnergy      = 1e-6;
 
     const auto hub_anchor = pdc_ref_anchor_host_frame_.load(std::memory_order_relaxed);
@@ -342,8 +345,16 @@ void HubProcessor::pdcCalibratorTick() {
         const auto sat_wp_now = rb.writePos();
         if (sat_wp_now < static_cast<std::uint64_t>(N)) continue;
 
-        const auto sat_anchor = region_->slots[i].anchor_host_frame.load(std::memory_order_acquire);
-        if (sat_anchor == 0) continue;  // sat hasn't anchored yet
+        // Use last_write_host_frame (master frame at END of sat's most recent
+        // processBlock) as the master-time anchor for the sat window. This is
+        // necessary for clip-gated tracks: their wp doesn't grow continuously
+        // with master time (the host skips processBlock when no clip is
+        // active), so `anchor_host_frame + wp` is wrong. last_write_host_frame
+        // is updated every time sat writes, so it correctly identifies what
+        // master time the latest sat samples belong to.
+        const auto sat_last_master =
+            region_->slots[i].last_write_host_frame.load(std::memory_order_acquire);
+        if (sat_last_master <= 0) continue;  // sat hasn't written yet
 
         const auto sat_start = sat_wp_now - static_cast<std::uint64_t>(N);
         if (!rb.peekAt(sat_start, sat_interleaved.data(), N)) continue;  // overrun
@@ -352,15 +363,17 @@ void HubProcessor::pdcCalibratorTick() {
                 = 0.5f * (sat_interleaved[j * 2] + sat_interleaved[j * 2 + 1]);
         }
 
-        // Sat content at sat_wp=X is for music (sat_anchor + X + D). Hub
-        // content at hub_wp=Y is for music (hub_anchor + Y). Same music when
-        // hub_anchor + Y = sat_anchor + X + D, i.e. Y = X + D + (sat_anchor - hub_anchor).
-        // For lag k = D, the matching hub window start equals:
-        //   hub_start = sat_start + D + (sat_anchor - hub_anchor)
-        // We sweep k around the D=0 baseline.
+        // Sat's last N samples cover master times [sat_last_master - N, sat_last_master)
+        // — assuming sat fired continuously over those frames. For clip-gated
+        // tracks this holds inside a clip burst (the typical case where audio
+        // is actually present). Hub's audio at hub_wp Y is for master time
+        // (hub_anchor + Y). To match sat's window content at D=0, hub window
+        // starts at hub_wp = (sat_last_master - N) - hub_anchor. For lag k=D,
+        // hub window starts D samples later (sat content for master T appears
+        // in hub at hub_wp such that the SAME music is at hub_wp - D, because
+        // sat's content is pre-rolled D ahead by the DAW's PDC).
         const std::int64_t baseline_start =
-            static_cast<std::int64_t>(sat_start)
-            + (static_cast<std::int64_t>(sat_anchor) - hub_anchor);
+            static_cast<std::int64_t>(sat_last_master) - N - hub_anchor;
 
         const std::int64_t hub_window_start = baseline_start - K;
         const int hub_window_len = N + 2 * K;

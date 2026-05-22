@@ -36,11 +36,9 @@ public:
     void setMixState(bool mute, bool solo, bool record_arm,
                      float gain_db, float norm_db, float target_lufs);
 
-    // PDC state: the auto-measured offset in samples (kNoMeasure if not yet
-    // measured), any user override (kNoMeasure = none), and the sample rate
-    // for ms conversion. Displayed as "PDC: 13.0 ms" with an [edit] field
-    // for manual override (user reads their DAW's reported per-track latency
-    // and types it in if they want to verify / correct).
+    // Per-track latency offset (PDC, measured by cross-correlation).
+    // Displayed as "Latency: 13.0 ms" with an editable field for manual
+    // override.
     static constexpr long long kPdcUnknown = std::numeric_limits<long long>::min();
     void setPdcState(long long measured_samples, long long override_samples,
                      double sample_rate);
