@@ -6,8 +6,10 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "measurement/Loudness.h"
 #include "protocol/SharedRegion.h"
@@ -239,6 +241,46 @@ public:
         if (slot < 0 || slot >= static_cast<int>(expected_samples_.size())) return nullptr;
         return &expected_samples_[slot];
     }
+
+    // --- Per-sat PDC measurement ---------------------------------------------
+    // Each sat's audio at its ring's wp = X represents music position
+    // (master_at_wp_X + D) — D > 0 means the DAW pre-rolled this sat's
+    // upstream chain (typically a latent sampler) so its output reaches
+    // master in time. We can't read D from any host API (Bitwig passes a
+    // uniform master playhead to every plugin regardless of track PDC), so
+    // we measure it by cross-correlating each sat's SHM stream against the
+    // hub's own input — which is PDC-aligned by the DAW and so serves as
+    // the absolute-time reference.
+    //
+    // `pdc_d_samples_[i]` is the latest *measured* D for slot i. Updated by
+    // the PdcCalibrator background thread. INT64_MIN sentinel = not yet
+    // measured. `pdc_d_override_[i]` is a user-set value that takes
+    // precedence (UI: editable per-track field) when not INT64_MIN.
+    std::int64_t pdcDMeasured(int slot) const noexcept {
+        if (slot < 0 || slot >= static_cast<int>(pdc_d_samples_.size())) return kPdcUnknown;
+        return pdc_d_samples_[static_cast<std::size_t>(slot)].load(std::memory_order_relaxed);
+    }
+    std::int64_t pdcDOverride(int slot) const noexcept {
+        if (slot < 0 || slot >= static_cast<int>(pdc_d_override_.size())) return kPdcUnknown;
+        return pdc_d_override_[static_cast<std::size_t>(slot)].load(std::memory_order_relaxed);
+    }
+    // Returns the value the writer/recorder should actually apply: override
+    // if set, else measured, else 0.
+    std::int64_t pdcDEffective(int slot) const noexcept {
+        const auto ov = pdcDOverride(slot);
+        if (ov != kPdcUnknown) return ov;
+        const auto m = pdcDMeasured(slot);
+        return (m == kPdcUnknown) ? 0 : m;
+    }
+    void setPdcDOverride(int slot, std::int64_t samples) noexcept {
+        if (slot < 0 || slot >= static_cast<int>(pdc_d_override_.size())) return;
+        pdc_d_override_[static_cast<std::size_t>(slot)].store(samples, std::memory_order_relaxed);
+    }
+    void clearPdcDOverride(int slot) noexcept {
+        if (slot < 0 || slot >= static_cast<int>(pdc_d_override_.size())) return;
+        pdc_d_override_[static_cast<std::size_t>(slot)].store(kPdcUnknown, std::memory_order_relaxed);
+    }
+    static constexpr std::int64_t kPdcUnknown = std::numeric_limits<std::int64_t>::min();
 
     // True when this AudioProcessor is being hosted by JUCE's standalone wrapper
     // (`Gatherer Hub.app`) rather than a DAW. Editors use it to choose deployment-
@@ -487,4 +529,29 @@ private:
     };
     std::unique_ptr<LufsWorker> lufs_worker_;
     void lufsWorkerTick();
+
+    // --- PDC measurement -----------------------------------------------------
+    // Hub captures its input audio (PDC-aligned mix from the parent bus) into
+    // a mono reference ring. The PdcCalibrator worker periodically cross-
+    // correlates each active sat's SHM stream against this ring to estimate
+    // per-sat D.
+    static constexpr std::uint32_t kPdcRefCapacity = 131072u;  // ~2.73s @ 48k, power of two
+    gatherer::SpscRingBuffer::Header   pdc_ref_header_{};
+    std::vector<float>                 pdc_ref_data_;  // size = kPdcRefCapacity, mono
+    std::atomic<std::int64_t>          pdc_ref_anchor_host_frame_{ 0 };  // master frame at hub's first ref-ring write
+    std::atomic<bool>                  pdc_ref_anchor_set_{ false };
+
+    std::array<std::atomic<std::int64_t>, gatherer::protocol::NUM_SLOTS> pdc_d_samples_;
+    std::array<std::atomic<std::int64_t>, gatherer::protocol::NUM_SLOTS> pdc_d_override_;
+
+    class PdcCalibrator : public juce::Thread {
+    public:
+        explicit PdcCalibrator(HubProcessor& p)
+            : juce::Thread("GathererPdc"), processor_(p) {}
+        void run() override;
+    private:
+        HubProcessor& processor_;
+    };
+    std::unique_ptr<PdcCalibrator> pdc_calibrator_;
+    void pdcCalibratorTick();
 };

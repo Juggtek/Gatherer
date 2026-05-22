@@ -658,6 +658,13 @@ void HubEditor::timerCallback() {
             row_ptr->onMoveDown = [this, slot_idx] {
                 processor_.moveSlotInDisplayOrder(slot_idx, +1);
             };
+            row_ptr->onPdcOverrideChanged = [this, slot_idx](long long samples) {
+                if (samples == LayerRow::kPdcUnknown) {
+                    processor_.clearPdcDOverride(slot_idx);
+                } else {
+                    processor_.setPdcDOverride(slot_idx, samples);
+                }
+            };
             // New row → inherit the current global target if the per-slot target
             // is still at its default. (State-restore paths preserve whatever
             // was saved.)
@@ -680,6 +687,16 @@ void HubEditor::timerCallback() {
 
         const auto lufs = processor_.getSlotLufs(s.slot_index);
         row_ptr->setLufs(lufs.integrated, lufs.momentary, lufs.short_term);
+
+        // Per-sat PDC state (auto-measured + user override).
+        {
+            const auto m  = processor_.pdcDMeasured(s.slot_index);
+            const auto ov = processor_.pdcDOverride(s.slot_index);
+            row_ptr->setPdcState(
+                m  == HubProcessor::kPdcUnknown ? LayerRow::kPdcUnknown : static_cast<long long>(m),
+                ov == HubProcessor::kPdcUnknown ? LayerRow::kPdcUnknown : static_cast<long long>(ov),
+                processor_.getSampleRate());
+        }
 
         const auto rec_file = processor_.getLastRecordingForSlot(s.slot_index);
         row_ptr->setRecordingAvailable(rec_file != juce::File{} && rec_file.existsAsFile());

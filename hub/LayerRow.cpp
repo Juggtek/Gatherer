@@ -1,5 +1,7 @@
 #include "LayerRow.h"
 
+#include <cmath>
+
 namespace {
 // Strip is laid out left-to-right in signal-flow order:
 //   [move ↑/↓][color][info][R][NORM: target + N + dB][VOL][M][S][meters][readout]
@@ -124,6 +126,39 @@ LayerRow::LayerRow() {
     norm_db_label_.setTooltip("Current normalize-stage gain.");
     addAndMakeVisible(norm_db_label_);
 
+    // PDC field. Editable click-to-edit; blank input clears the override.
+    pdc_label_.setEditable(false, true, false);
+    pdc_label_.setFont(juce::FontOptions(10.0f));
+    pdc_label_.setJustificationType(juce::Justification::centredLeft);
+    pdc_label_.setColour(juce::Label::textColourId,
+                         juce::Colours::white.withAlpha(0.7f));
+    pdc_label_.setColour(juce::Label::backgroundColourId,
+                         juce::Colours::black.withAlpha(0.25f));
+    pdc_label_.setColour(juce::Label::backgroundWhenEditingColourId,
+                         juce::Colours::black.withAlpha(0.6f));
+    pdc_label_.setColour(juce::Label::textWhenEditingColourId, juce::Colours::white);
+    pdc_label_.setText("PDC: —", juce::dontSendNotification);
+    pdc_label_.setTooltip("Per-track PDC offset (ms). Auto-measured by cross-"
+                          "correlating this sat's audio against the hub's input. "
+                          "Click to edit and override (e.g. if your DAW reports a "
+                          "known per-track latency). Type 'auto' or blank to clear.");
+    pdc_label_.onTextChange = [this] {
+        const auto txt = pdc_label_.getText().trim().toLowerCase();
+        if (! onPdcOverrideChanged) { updatePdcLabel(); return; }
+        if (txt.isEmpty() || txt == "auto" || txt == "—") {
+            onPdcOverrideChanged(kPdcUnknown);
+        } else {
+            // Accept "13", "13.0", "13 ms", "13.0ms" — strip non-numeric tail.
+            const auto ms = txt.getDoubleValue();
+            const auto samples = (pdc_sample_rate_ > 0.0)
+                ? static_cast<long long>(std::llround(ms * 0.001 * pdc_sample_rate_))
+                : 0LL;
+            onPdcOverrideChanged(samples);
+        }
+        updatePdcLabel();
+    };
+    addAndMakeVisible(pdc_label_);
+
     gain_slider_.setSliderStyle(juce::Slider::LinearHorizontal);
     gain_slider_.setRange(kGainDbMin, kGainDbMax, 0.1);
     gain_slider_.setValue(0.0, juce::dontSendNotification);
@@ -202,6 +237,32 @@ void LayerRow::setLufs(float integrated, float momentary, float short_term) {
         lufs_short_term_ = short_term;
         repaint(readoutArea());
     }
+}
+
+void LayerRow::setPdcState(long long measured_samples, long long override_samples,
+                            double sample_rate) {
+    if (measured_samples == pdc_measured_samples_
+        && override_samples == pdc_override_samples_
+        && sample_rate == pdc_sample_rate_) return;
+    pdc_measured_samples_ = measured_samples;
+    pdc_override_samples_ = override_samples;
+    pdc_sample_rate_      = sample_rate;
+    updatePdcLabel();
+}
+
+void LayerRow::updatePdcLabel() {
+    if (pdc_label_.isBeingEdited()) return;  // don't clobber the user's typing
+    const bool   has_override = (pdc_override_samples_ != kPdcUnknown);
+    const long long shown_samp = has_override ? pdc_override_samples_ : pdc_measured_samples_;
+    if (shown_samp == kPdcUnknown || pdc_sample_rate_ <= 0.0) {
+        pdc_label_.setText(has_override ? "PDC: (override blank)" : "PDC: —",
+                            juce::dontSendNotification);
+        return;
+    }
+    const double ms = (static_cast<double>(shown_samp) / pdc_sample_rate_) * 1000.0;
+    juce::String txt = "PDC: " + juce::String(ms, 2) + " ms";
+    if (has_override) txt += "  (manual)";
+    pdc_label_.setText(txt, juce::dontSendNotification);
 }
 
 void LayerRow::setMixState(bool mute, bool solo, bool record_arm,
@@ -312,8 +373,9 @@ void LayerRow::resized() {
 
     // Info
     auto info = strip.removeFromLeft(kInfoAreaWidth).reduced(8, 4);
-    track_.setBounds(info.removeFromTop(22));
-    name_ .setBounds(info);
+    track_.setBounds(info.removeFromTop(16));
+    name_ .setBounds(info.removeFromTop(16));
+    pdc_label_.setBounds(info.removeFromTop(14));
     strip.removeFromLeft(kSectionGap);
 
     const int btn_y = strip.getY() + (strip.getHeight() - kButtonSize) / 2;

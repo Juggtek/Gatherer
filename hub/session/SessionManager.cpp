@@ -184,6 +184,15 @@ juce::var SessionManager::buildManifestVar() const {
         mix->setProperty("record_arm",  processor_.getRecordArm(i));
         s->setProperty("mix", juce::var(mix));
 
+        // PDC override (manually set by the user via the LayerRow's PDC field).
+        // The auto-measured value is *not* persisted — it's re-measured every
+        // session, and persisting it would mask whether the calibrator is
+        // currently working. Only the override is sticky.
+        const auto pdc_ov = processor_.pdcDOverride(i);
+        if (pdc_ov != HubProcessor::kPdcUnknown) {
+            s->setProperty("pdc_override_samples", static_cast<juce::int64>(pdc_ov));
+        }
+
         const auto rec = processor_.getLastRecordingForSlot(i);
         if (rec != juce::File{}) {
             s->setProperty("recording", rec.getFileName());
@@ -276,6 +285,13 @@ bool SessionManager::applyManifestVar(const juce::var& v) {
                     processor_.setSlotTargetLufs(idx, static_cast<float>(static_cast<double>(mix["target_lufs"])));
                 if (mix.hasProperty("record_arm"))
                     processor_.setRecordArm(idx, static_cast<bool>(mix["record_arm"]));
+            }
+
+            if (s_var.hasProperty("pdc_override_samples")) {
+                processor_.setPdcDOverride(
+                    idx, static_cast<std::int64_t>(static_cast<juce::int64>(s_var["pdc_override_samples"])));
+            } else {
+                processor_.clearPdcDOverride(idx);
             }
         }
     }

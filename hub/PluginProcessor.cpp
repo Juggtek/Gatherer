@@ -61,6 +61,11 @@ HubProcessor::HubProcessor()
     for (std::size_t i = 0; i < display_order_.size(); ++i)
         display_order_[i] = static_cast<int>(i);
 
+    // PDC: start all sat estimates and overrides as unknown so the UI can
+    // show "not measured yet" until cross-correlation produces a value.
+    for (auto& a : pdc_d_samples_)   a.store(kPdcUnknown, std::memory_order_relaxed);
+    for (auto& a : pdc_d_override_)  a.store(kPdcUnknown, std::memory_order_relaxed);
+
     my_uuid_ = generateInstanceId();
     // Standalone defaults to summing system-audio input with the sat mix (otherwise
     // the standalone has no use for its audio device input). In-DAW VST3 defaults to
@@ -84,8 +89,13 @@ HubProcessor::HubProcessor()
 }
 
 HubProcessor::~HubProcessor() {
-    // Stop the LUFS worker first — it reads sat rings via region_, so it
+    // Stop background workers first — they read sat rings via region_, so they
     // must be torn down before detachFromShm clears the region pointer.
+    if (pdc_calibrator_) {
+        pdc_calibrator_->signalThreadShouldExit();
+        pdc_calibrator_->stopThread(1000);
+        pdc_calibrator_.reset();
+    }
     if (lufs_worker_) {
         lufs_worker_->signalThreadShouldExit();
         lufs_worker_->stopThread(1000);
@@ -160,6 +170,21 @@ void HubProcessor::prepareToPlay(double sampleRate, int samplesPerBlock) {
     lufs_worker_ = std::make_unique<LufsWorker>(*this);
     lufs_worker_->startThread();
 
+    // PDC measurement: allocate the mono reference ring and (re)start the
+    // calibrator. The ring stores hub's PDC-aligned input audio; the worker
+    // periodically cross-correlates each sat against this reference to
+    // estimate per-sat D.
+    if (pdc_calibrator_) {
+        pdc_calibrator_->signalThreadShouldExit();
+        pdc_calibrator_->stopThread(1000);
+        pdc_calibrator_.reset();
+    }
+    pdc_ref_data_.assign(static_cast<std::size_t>(kPdcRefCapacity), 0.0f);
+    gatherer::SpscRingBuffer::initialize(pdc_ref_header_);
+    pdc_ref_anchor_set_.store(false, std::memory_order_release);
+    pdc_calibrator_ = std::make_unique<PdcCalibrator>(*this);
+    pdc_calibrator_->startThread();
+
     playback_.prepare(sampleRate, samplesPerBlock);
 
     // Report 1-block PDC latency so the host can compensate. The hub may receive a
@@ -176,6 +201,11 @@ void HubProcessor::prepareToPlay(double sampleRate, int samplesPerBlock) {
 }
 
 void HubProcessor::releaseResources() {
+    if (pdc_calibrator_) {
+        pdc_calibrator_->signalThreadShouldExit();
+        pdc_calibrator_->stopThread(1000);
+        pdc_calibrator_.reset();
+    }
     if (lufs_worker_) {
         lufs_worker_->signalThreadShouldExit();
         lufs_worker_->stopThread(1000);
@@ -263,6 +293,120 @@ void HubProcessor::lufsWorkerTick() {
     }
 }
 
+void HubProcessor::PdcCalibrator::run() {
+    while (!threadShouldExit()) {
+        processor_.pdcCalibratorTick();
+        wait(500);  // ~2Hz — D doesn't change at runtime, polling slowly is fine
+    }
+}
+
+// Cross-correlate each active sat's recent audio against the hub-input
+// reference ring to estimate D. The reference ring is the DAW-PDC-aligned
+// mix; sat rings carry pre-PDC content from each track. The peak lag of
+// the cross-correlation IS the per-track pre-roll D — positive means sat's
+// content is `D` samples ahead of what master heard at the same wall-clock.
+void HubProcessor::pdcCalibratorTick() {
+    if (region_ == nullptr) return;
+    if (!pdc_ref_anchor_set_.load(std::memory_order_acquire)) return;
+
+    constexpr int N = 4096;  // sat window length (~85ms @ 48k)
+    constexpr int K = 2048;  // ± lag search range (~43ms @ 48k)
+    constexpr double kMinCorrelation = 0.3;
+    constexpr double kMinEnergy      = 1e-6;
+
+    const auto hub_anchor = pdc_ref_anchor_host_frame_.load(std::memory_order_relaxed);
+    const auto cap        = static_cast<std::uint32_t>(pdc_ref_data_.size());
+    const auto hub_mask   = cap - 1u;
+    const auto hub_wp_now = pdc_ref_header_.write_pos.load(std::memory_order_acquire);
+    if (hub_wp_now < static_cast<std::uint64_t>(N + 2 * K)) return;
+
+    auto readHub = [&](std::int64_t start_wp, int len, std::vector<float>& out) {
+        out.resize(static_cast<std::size_t>(len));
+        for (int i = 0; i < len; ++i) {
+            const auto idx = static_cast<std::uint32_t>(
+                (static_cast<std::uint64_t>(start_wp + i)) & hub_mask);
+            out[static_cast<std::size_t>(i)] = pdc_ref_data_[idx];
+        }
+    };
+
+    std::vector<float> sat_interleaved(static_cast<std::size_t>(N) * RING_CHANNELS);
+    std::vector<float> sat_mono(static_cast<std::size_t>(N));
+    std::vector<float> hub_window;
+
+    for (std::uint32_t i = 0; i < gatherer::protocol::NUM_SLOTS; ++i) {
+        if (region_->slots[i].state.load(std::memory_order_acquire) != SLOT_STATE_ACTIVE) continue;
+
+        SpscRingBuffer rb(region_->slots[i].ring_header,
+                          region_->slots[i].ring_data,
+                          RING_FRAMES, RING_CHANNELS);
+        const auto sat_wp_now = rb.writePos();
+        if (sat_wp_now < static_cast<std::uint64_t>(N)) continue;
+
+        const auto sat_anchor = region_->slots[i].anchor_host_frame.load(std::memory_order_acquire);
+        if (sat_anchor == 0) continue;  // sat hasn't anchored yet
+
+        const auto sat_start = sat_wp_now - static_cast<std::uint64_t>(N);
+        if (!rb.peekAt(sat_start, sat_interleaved.data(), N)) continue;  // overrun
+        for (int j = 0; j < N; ++j) {
+            sat_mono[static_cast<std::size_t>(j)]
+                = 0.5f * (sat_interleaved[j * 2] + sat_interleaved[j * 2 + 1]);
+        }
+
+        // Sat content at sat_wp=X is for music (sat_anchor + X + D). Hub
+        // content at hub_wp=Y is for music (hub_anchor + Y). Same music when
+        // hub_anchor + Y = sat_anchor + X + D, i.e. Y = X + D + (sat_anchor - hub_anchor).
+        // For lag k = D, the matching hub window start equals:
+        //   hub_start = sat_start + D + (sat_anchor - hub_anchor)
+        // We sweep k around the D=0 baseline.
+        const std::int64_t baseline_start =
+            static_cast<std::int64_t>(sat_start)
+            + (static_cast<std::int64_t>(sat_anchor) - hub_anchor);
+
+        const std::int64_t hub_window_start = baseline_start - K;
+        const int hub_window_len = N + 2 * K;
+        if (hub_window_start < 0) continue;
+        if (static_cast<std::uint64_t>(hub_window_start + hub_window_len) > hub_wp_now) continue;
+        if (hub_wp_now > static_cast<std::uint64_t>(hub_window_start)
+            && hub_wp_now - static_cast<std::uint64_t>(hub_window_start) > cap) continue;
+
+        readHub(hub_window_start, hub_window_len, hub_window);
+
+        double norm_sat = 0.0;
+        for (int j = 0; j < N; ++j) {
+            const double s = sat_mono[static_cast<std::size_t>(j)];
+            norm_sat += s * s;
+        }
+        if (norm_sat < kMinEnergy) continue;  // sat is silent
+
+        // Sweep lag k. Peak |sum| is the alignment.
+        double max_abs    = 0.0;
+        int    best_k     = 0;
+        for (int k = -K; k <= K; ++k) {
+            const int hub_offset = K + k;
+            double sum = 0.0;
+            for (int j = 0; j < N; ++j) {
+                sum += static_cast<double>(sat_mono[static_cast<std::size_t>(j)])
+                     * static_cast<double>(hub_window[static_cast<std::size_t>(hub_offset + j)]);
+            }
+            const double absSum = std::abs(sum);
+            if (absSum > max_abs) { max_abs = absSum; best_k = k; }
+        }
+
+        double norm_hub = 0.0;
+        for (int j = 0; j < N; ++j) {
+            const double h = hub_window[static_cast<std::size_t>(K + best_k + j)];
+            norm_hub += h * h;
+        }
+        if (norm_hub < kMinEnergy) continue;
+
+        const double normalized = max_abs / std::sqrt(norm_sat * norm_hub);
+        if (normalized < kMinCorrelation) continue;  // ambiguous, skip
+
+        pdc_d_samples_[i].store(static_cast<std::int64_t>(best_k),
+                                 std::memory_order_relaxed);
+    }
+}
+
 bool HubProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const {
     return layouts.getMainOutputChannelSet() == juce::AudioChannelSet::stereo()
         && (layouts.getMainInputChannelSet() == juce::AudioChannelSet::stereo()
@@ -272,6 +416,40 @@ bool HubProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const {
 void HubProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer&) {
     juce::ScopedNoDenormals noDenormals;
     const int frames = buffer.getNumSamples();
+
+    // PDC reference capture. Hub's input *is* the parent-bus mix as the DAW
+    // hands it to us — by which point the DAW has already applied PDC across
+    // every child track. That makes it a sample-accurate reference for
+    // "music at master time T". Push a mono-summed copy into the ref ring
+    // before we touch the buffer, so the calibrator can correlate each sat
+    // against it.
+    if (!pdc_ref_data_.empty() && frames > 0) {
+        const auto* L = buffer.getReadPointer(0);
+        const auto* R = buffer.getNumChannels() > 1 ? buffer.getReadPointer(1) : L;
+        const auto cap  = static_cast<std::uint32_t>(pdc_ref_data_.size());
+        const auto mask = cap - 1u;
+        const auto wp_before = pdc_ref_header_.write_pos.load(std::memory_order_relaxed);
+        for (int i = 0; i < frames; ++i) {
+            const auto idx = static_cast<std::uint32_t>((wp_before + static_cast<std::uint64_t>(i)) & mask);
+            pdc_ref_data_[idx] = 0.5f * (L[i] + R[i]);
+        }
+        pdc_ref_header_.write_pos.store(wp_before + static_cast<std::uint64_t>(frames),
+                                         std::memory_order_release);
+
+        // First-time anchor: master frame at the start of this block. Lets
+        // the calibrator translate ref-ring wp positions back to master time
+        // when comparing to sat anchors.
+        if (!pdc_ref_anchor_set_.load(std::memory_order_relaxed)) {
+            if (auto* ph = getPlayHead()) {
+                if (auto pos = ph->getPosition()) {
+                    if (auto t = pos->getTimeInSamples()) {
+                        pdc_ref_anchor_host_frame_.store(*t, std::memory_order_relaxed);
+                        pdc_ref_anchor_set_.store(true, std::memory_order_release);
+                    }
+                }
+            }
+        }
+    }
 
     // Input handling — see isIncludeTrackInput() doc.
     //   OFF: discard whatever the host gave us; output is purely the sat-ring mix.
@@ -941,7 +1119,23 @@ bool HubProcessor::actuallyStartRecording() {
         a.track_name       = juce::String::fromUTF8(region_->slots[i].track_name);
         a.display_name     = juce::String::fromUTF8(region_->slots[i].display_name);
         a.thumbnail        = thumbnails_[i].get();
-        a.start_wp         = recording_start_wp_[i].load(std::memory_order_acquire);
+
+        // Apply per-sat PDC compensation. The cross-correlator measured D
+        // such that sat's content at sat_wp = X is for music (master + D).
+        // To put music at master time T at the WAV frame for T (= frame
+        // (T - recording_start_master)), the writer must read sat's ring
+        // D samples *earlier* than the naive snapshot wp. D > 0 (sat
+        // pre-rolled by a latent sampler upstream) → start_wp shifts back.
+        const auto snap_wp = recording_start_wp_[i].load(std::memory_order_acquire);
+        const auto d_samples = pdcDEffective(static_cast<int>(i));
+        // Clamp to the ring's reachable history: at any wp, the ring holds
+        // the most recent RING_FRAMES samples. Reading further back returns
+        // nothing usable (peekAt would fail).
+        std::int64_t d_clamped = d_samples;
+        const std::int64_t max_back = static_cast<std::int64_t>(gatherer::protocol::RING_FRAMES) - 1;
+        if (d_clamped > max_back) d_clamped = max_back;
+        if (d_clamped > static_cast<std::int64_t>(snap_wp)) d_clamped = static_cast<std::int64_t>(snap_wp);
+        a.start_wp         = snap_wp - static_cast<std::uint64_t>(d_clamped > 0 ? d_clamped : 0);
         a.expected_samples = pad ? &expected_samples_[i] : nullptr;
         armed.push_back(a);
     }
