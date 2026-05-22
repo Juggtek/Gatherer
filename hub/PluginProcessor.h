@@ -424,14 +424,20 @@ private:
 
     // Display-order permutation. display_order_[i] = slot_index at position i.
     // Only touched by the message thread (UI / manifest I/O).
-    //
-    // TODO (post-Adaptive-Mixer phase): fix the 1-block recording offset by
-    // tracking prev_sat_wp_ at the end of each processBlock and using that as
-    // the snapshot anchor at the rising edge of armed+playing. In pad-ON mode
-    // also capture per-slot start_in_beats at snapshot time (start_in_beats =
-    // now_beats directly) since the delta-based formula yields F_block_end for
-    // delta==0 slots, which is one block too late.
     std::array<int, gatherer::protocol::NUM_SLOTS> display_order_{};
+
+    // Per-slot snapshot from the previous processBlock — used as the snapshot
+    // anchor at the play-rising-edge so recording sample 0 lines up with the
+    // first sample of the play-start block (rather than the next block, which
+    // is what reading sat.wp_now *after* sat's upstream write would give).
+    //
+    // Audio-thread-only. UUID is tracked alongside so a sat reclaim between
+    // blocks invalidates the stale wp (we fall back to the current value).
+    struct PrevSlotSnapshot {
+        std::uint64_t wp   = 0;
+        std::uint64_t uuid = 0;
+    };
+    std::array<PrevSlotSnapshot, gatherer::protocol::NUM_SLOTS> prev_slot_state_{};
 
     // Armed-but-not-yet-recording state. startRecording (message thread) only
     // flips `armed_pending_`; the audio thread does the actual sat.wp

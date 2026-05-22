@@ -301,19 +301,54 @@ void HubProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuff
         if (playing_now
             && armed_pending_.load(std::memory_order_acquire)
             && !play_trigger_posted_.exchange(true, std::memory_order_acq_rel)) {
-            // Race-free wp snapshot: one audio callback sees a single
-            // atomic point in time for every slot. All armed slots'
-            // recording_start_wp_ get the wp from THIS block's tail, so
-            // every recording begins at the same DAW frame.
+            // Race-free wp snapshot, all armed slots in one audio callback.
+            // The anchor is wp_at_start_of_THIS_block (= prev_slot_state_[i].wp,
+            // updated at the end of the previous processBlock) so recording
+            // sample 0 corresponds to the first sample of the play-start
+            // block — not the next one, which is what sat.wp_now after sat's
+            // upstream write would give us.
+            //
+            // For pad-ON we also capture per-slot start_in_beats here, set to
+            // now_beats (block start). The delta-based formula used by the
+            // grid-capture loop later would give F_block_end for any slot
+            // with delta == 0 (a clip-gated sat that didn't write this block),
+            // which would offset the WAV's timeline by one block.
+            const bool pad_at_snapshot = pad_silence_in_record_.load(std::memory_order_relaxed);
+            double snap_now_seconds = 0.0;
+            double snap_now_beats   = 0.0;
+            if (auto* ph = getPlayHead()) {
+                if (auto pos_in = ph->getPosition()) {
+                    if (auto s = pos_in->getTimeInSeconds()) snap_now_seconds = *s;
+                    if (auto p = pos_in->getPpqPosition())   snap_now_beats   = *p;
+                }
+            }
             for (std::uint32_t i = 0; i < NUM_SLOTS; ++i) {
                 if (region_->slots[i].state.load(std::memory_order_acquire) != SLOT_STATE_ACTIVE) continue;
                 if (!mix_[i].record_arm.load(std::memory_order_relaxed)) continue;
-                const auto wp = region_->slots[i].ring_header.write_pos
+
+                // If the sat occupying this slot has changed since we last
+                // saw it (mid-session reclaim), prev_slot_state_[i].wp refers
+                // to the previous sat's ring and is stale — fall back to the
+                // sat's current wp.
+                const auto cur_uuid = region_->slots[i].sat_uuid.load(std::memory_order_acquire);
+                std::uint64_t wp_anchor = prev_slot_state_[i].wp;
+                if (cur_uuid != prev_slot_state_[i].uuid) {
+                    wp_anchor = region_->slots[i].ring_header.write_pos
                                     .load(std::memory_order_acquire);
-                recording_start_wp_[i].store(wp, std::memory_order_release);
+                }
+
+                recording_start_wp_[i].store(wp_anchor, std::memory_order_release);
                 recording_active_  [i].store(true, std::memory_order_release);
                 expected_samples_  [i].store(0, std::memory_order_release);
-                grid_.per_slot[i].captured.store(false, std::memory_order_release);
+
+                auto& ps = grid_.per_slot[i];
+                if (pad_at_snapshot) {
+                    ps.start_in_seconds.store(snap_now_seconds, std::memory_order_relaxed);
+                    ps.start_in_beats  .store(snap_now_beats,   std::memory_order_relaxed);
+                    ps.captured        .store(true, std::memory_order_release);
+                } else {
+                    ps.captured.store(false, std::memory_order_release);
+                }
             }
             juce::MessageManager::callAsync([this] {
                 play_trigger_posted_.store(false, std::memory_order_release);
@@ -512,6 +547,15 @@ void HubProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuff
     }
 
     if (transport_playing) playback_.advancePlayhead(frames);
+
+    // Update per-slot snapshots for next block's potential rising-edge use.
+    // Stores wp_after_this_block, which equals wp_at_start_of_next_block.
+    // Also tracks sat uuid so a reclaim between blocks invalidates the wp.
+    for (std::uint32_t i = 0; i < NUM_SLOTS; ++i) {
+        const auto& sat = region_->slots[i];
+        prev_slot_state_[i].wp   = sat.ring_header.write_pos.load(std::memory_order_acquire);
+        prev_slot_state_[i].uuid = sat.sat_uuid.load(std::memory_order_acquire);
+    }
 }
 
 juce::AudioProcessorEditor* HubProcessor::createEditor() {
