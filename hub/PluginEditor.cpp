@@ -492,16 +492,36 @@ void HubEditor::timerCallback() {
         const auto succ     = processor_.pdcSuccessCount();
         juce::String txt = "calibrator: ticks=" + juce::String((long long) ticks)
                           + " measurements=" + juce::String((long long) succ);
-        // Show per-slot raw measured samples too (whether the publication
-        // succeeded), so we can see what the cross-correlator found.
+        // Show per-slot skip reason or measured value so we can see WHY
+        // the calibrator isn't publishing.
+        auto skipName = [](HubProcessor::PdcSkip s) -> const char* {
+            using S = HubProcessor::PdcSkip;
+            switch (s) {
+                case S::Ok:                  return "ok";
+                case S::SlotInactive:        return "inactive";
+                case S::SatNotWritten:       return "sat-no-writes";
+                case S::SatNotEnoughData:    return "sat-need-more";
+                case S::SatRingOverrun:      return "sat-overrun";
+                case S::SatSilent:           return "sat-silent";
+                case S::HubWindowBeforeZero: return "hub<0";
+                case S::HubWindowPastWrite:  return "hub>wp";
+                case S::HubWindowOutOfCap:   return "hub-too-old";
+                case S::HubSilent:           return "hub-silent";
+            }
+            return "?";
+        };
         const double sr = processor_.getSampleRate();
         for (std::uint32_t i = 0; i < gatherer::protocol::NUM_SLOTS; ++i) {
+            if (processor_.pdcLastSkip(static_cast<int>(i)) == HubProcessor::PdcSkip::SlotInactive
+                && processor_.pdcDMeasured(static_cast<int>(i)) == HubProcessor::kPdcUnknown) continue;
+            txt += "  s" + juce::String((int) i) + ":";
             const auto d = processor_.pdcDMeasured(static_cast<int>(i));
-            if (d == HubProcessor::kPdcUnknown) continue;
-            const double ms = (sr > 0.0) ? (static_cast<double>(d) / sr) * 1000.0 : 0.0;
-            txt += "  s" + juce::String((int) i) + ":"
-                 + juce::String((long long) d) + " ("
-                 + juce::String(ms, 1) + "ms)";
+            if (d != HubProcessor::kPdcUnknown) {
+                const double ms = (sr > 0.0) ? (static_cast<double>(d) / sr) * 1000.0 : 0.0;
+                txt += juce::String((long long) d) + "s(" + juce::String(ms, 1) + "ms)";
+            } else {
+                txt += juce::String(skipName(processor_.pdcLastSkip(static_cast<int>(i))));
+            }
         }
         pdc_diag_label_.setText(txt, juce::dontSendNotification);
     }

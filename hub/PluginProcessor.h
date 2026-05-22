@@ -551,7 +551,27 @@ private:
 public:
     std::uint64_t pdcTickCount()    const noexcept { return pdc_tick_count_.load(std::memory_order_relaxed); }
     std::uint64_t pdcSuccessCount() const noexcept { return pdc_success_count_.load(std::memory_order_relaxed); }
+
+    // Per-slot last-skip reason. Empty string = either the slot is not
+    // active, or the last attempt succeeded.
+    enum class PdcSkip : std::uint8_t {
+        Ok = 0,
+        SlotInactive,
+        SatNotWritten,
+        SatNotEnoughData,
+        SatRingOverrun,
+        SatSilent,
+        HubWindowBeforeZero,
+        HubWindowPastWrite,
+        HubWindowOutOfCap,
+        HubSilent,
+    };
+    PdcSkip pdcLastSkip(int slot) const noexcept {
+        if (slot < 0 || slot >= static_cast<int>(pdc_last_skip_.size())) return PdcSkip::SlotInactive;
+        return static_cast<PdcSkip>(pdc_last_skip_[static_cast<std::size_t>(slot)].load(std::memory_order_relaxed));
+    }
 private:
+    std::array<std::atomic<std::uint8_t>, gatherer::protocol::NUM_SLOTS> pdc_last_skip_{};
 
     class PdcCalibrator : public juce::Thread {
     public:
