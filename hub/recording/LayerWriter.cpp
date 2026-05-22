@@ -122,6 +122,13 @@ void LayerWriter::run() {
     std::vector<float>       interleaved(static_cast<std::size_t>(kChunkFrames)
                                             * RING_CHANNELS);
 
+    // Smaller-than-kChunkFrames pad step so an in-flight pad doesn't swallow
+    // a sat-write that happened during the pad. With kChunkFrames=4096 a sat
+    // that started writing mid-pad would leave a visible ~85ms silence gap
+    // before the audio begins; 256 samples caps that to ~5ms (and the recheck
+    // below usually catches it before any silence at all is committed).
+    constexpr std::uint32_t kPadStep = 256;
+
     while (!threadShouldExit()) {
         const auto wp        = rb.writePos();
         const auto real_avail = (wp > read_pos_) ? (wp - read_pos_) : 0ull;
@@ -146,10 +153,23 @@ void LayerWriter::run() {
             } else if (take_real > 0) {
                 drainChunk(static_cast<std::uint32_t>(take_real), interleaved, planar);
             } else {
-                const auto pad = static_cast<std::uint32_t>(
-                    std::min<std::uint64_t>(needed,
-                                             static_cast<std::uint64_t>(kChunkFrames)));
-                writeSilence(pad, planar);
+                // Real audio looked unavailable at the top of this iteration;
+                // re-check sat.wp right before padding so a sat that started
+                // writing in the meantime gets drained instead of silently
+                // overwritten with zeros.
+                const auto wp_recheck   = rb.writePos();
+                const auto real_recheck = (wp_recheck > read_pos_) ? (wp_recheck - read_pos_) : 0ull;
+                if (real_recheck > 0) {
+                    const auto take = static_cast<std::uint32_t>(
+                        std::min<std::uint64_t>({real_recheck, needed,
+                                                  static_cast<std::uint64_t>(kChunkFrames)}));
+                    drainChunk(take, interleaved, planar);
+                } else {
+                    const auto pad = static_cast<std::uint32_t>(
+                        std::min<std::uint64_t>(needed,
+                                                 static_cast<std::uint64_t>(kPadStep)));
+                    writeSilence(pad, planar);
+                }
             }
             continue;
         }
