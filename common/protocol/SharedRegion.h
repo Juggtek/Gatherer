@@ -90,18 +90,21 @@ struct SatelliteSlot {
     std::atomic<std::uint64_t> cal_start_hub_heartbeat;
     std::atomic<std::uint64_t> cal_start_wp;
 
-    // PDC-calibration solo control. Set by hub to silence this sat's output
-    // (sat continues to write its captured audio into the ring as normal,
-    // but clears its passthrough output buffer). Hub uses this during the
-    // per-sat PDC measurement: it mutes every sat except the one being
-    // measured, so the parent-bus mix → hub's input contains *only* the
-    // target sat's content. Cross-correlating sat's SHM stream against that
-    // mix becomes a near-trivial match, giving sample-accurate D.
-    std::atomic<std::uint32_t> cali_mute_output;     // 0 = pass through, 1 = output zeros
+    // PDC-calibration spike trigger. Set by hub when it wants this sat to
+    // emit a known impulse pattern into its output (and SHM ring) on the
+    // next processBlock. The spike then traverses Bitwig's track-output
+    // PDC delay before reaching hub — by comparing where the spike appears
+    // in sat's SHM ring vs in hub's input ref ring, we measure the per-
+    // track output delay that the DAW applies. Sat clears the flag back
+    // to 0 after firing once.
+    std::atomic<std::uint32_t> inject_spike;         // 0 = idle, 1 = inject on next block
+    // Sat records the wp at which it wrote the spike, so hub knows exactly
+    // where to look in sat's SHM ring without searching.
+    std::atomic<std::uint64_t> spike_wp;
 
     float                      ring_data[RING_FRAMES * RING_CHANNELS];
 
-    std::uint8_t               reserved[228];
+    std::uint8_t               reserved[220];
 };
 
 struct SharedRegion {

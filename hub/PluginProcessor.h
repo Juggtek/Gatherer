@@ -630,17 +630,17 @@ private:
         HubProcessor& processor_;
     };
     std::unique_ptr<PdcCalibrator> pdc_calibrator_;
-    void pdcCalibratorTick();
+    void runSpikeCalibration();
+    bool measureOneSatSpike(int slot);
 
-    // Solo-calibration state (driven by PdcCalibrator's run loop when
-    // `solo_cali_active_` is set).
+    // Calibration state (driven by PdcCalibrator's run loop when
+    // `solo_cali_active_` is set). "Solo cali" naming is legacy from the
+    // previous mute-others approach; current mechanism is spike injection.
     std::atomic<bool>            solo_cali_active_      { false };
-    std::atomic<int>             solo_cali_current_     { -1 };  // slot index currently being measured
+    std::atomic<int>             solo_cali_current_     { -1 };
     std::atomic<int>             solo_cali_total_       { 0 };
     std::atomic<int>             solo_cali_completed_   { 0 };
     std::atomic<std::uint8_t>    solo_cali_state_       { static_cast<std::uint8_t>(SoloCaliState::Idle) };
     juce::CriticalSection        solo_cali_message_lock_;
     std::string                  solo_cali_message_;
-    void runSoloCalibration();
-    bool measureOneSatSolo(int slot);
 };

@@ -179,19 +179,43 @@ void SatelliteProcessor::writeInterleavedToRing(const juce::AudioBuffer<float>& 
 void SatelliteProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer&) {
     juce::ScopedNoDenormals noDenormals;
     const int frames = buffer.getNumSamples();
-    writeInterleavedToRing(buffer, frames);
-    // Honor hub's PDC-calibration solo request: while cali_mute_output is set
-    // this sat clears its passthrough output, removing itself from Bitwig's
-    // parent-bus mix so hub can isolate a different sat. Sat's SHM ring is
-    // unaffected — hub still receives the captured audio there.
-    if (region_ != nullptr) {
+
+    // Honor hub's PDC-calibration spike request. When inject_spike is set,
+    // we overwrite the first 4 samples of the buffer with a known impulse
+    // pattern (+1, -1, +1, -1) — both in the output (so it propagates
+    // through Bitwig's track-output PDC delay to hub's input) and in our
+    // SHM ring (so hub can locate the spike from sat's side too). The
+    // difference between sat's spike wp and hub's input wp at which the
+    // spike appears equals the per-track output delay.
+    bool injected = false;
+    if (region_ != nullptr && frames >= 4) {
         const int idx = slot_index_.load(std::memory_order_acquire);
         if (idx >= 0 && idx < static_cast<int>(gatherer::protocol::NUM_SLOTS)) {
-            if (region_->slots[idx].cali_mute_output.load(std::memory_order_acquire) != 0u) {
-                buffer.clear();
+            auto& slot = region_->slots[idx];
+            std::uint32_t want = 1u;
+            if (slot.inject_spike.compare_exchange_strong(want, 0u,
+                                                            std::memory_order_acq_rel)) {
+                // Pattern engineered to be: (a) unambiguous against typical
+                // audio (alternating +1/-1 won't occur naturally), (b) sharp
+                // enough that finding its peak doesn't require correlation.
+                const float pat[4] = { 1.0f, -1.0f, 1.0f, -1.0f };
+                for (int ch = 0; ch < buffer.getNumChannels(); ++ch) {
+                    auto* w = buffer.getWritePointer(ch);
+                    for (int i = 0; i < 4; ++i) w[i] = pat[i];
+                }
+                // Record the wp at which sat is about to write the spike.
+                // writeInterleavedToRing below writes `frames` frames
+                // starting at sat's current wp. So the spike (first 4 samples)
+                // lands at the *current* wp.
+                SpscRingBuffer rb_wp(slot.ring_header, slot.ring_data, RING_FRAMES, RING_CHANNELS);
+                slot.spike_wp.store(rb_wp.writePos(), std::memory_order_release);
+                injected = true;
             }
         }
     }
+    juce::ignoreUnused(injected);
+
+    writeInterleavedToRing(buffer, frames);
     // Pass-through: leave buffer untouched.
 }
 
