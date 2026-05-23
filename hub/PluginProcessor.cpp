@@ -625,82 +625,44 @@ void HubProcessor::pdcCalibratorTick() {
 
         readHub(hub_window_start, hub_window_len, hub_window);
 
-        // Energy gates before paying for an FFT.
         double norm_sat = 0.0;
         for (int j = 0; j < N; ++j) {
             const double s = sat_mono[static_cast<std::size_t>(j)];
             norm_sat += s * s;
         }
         if (norm_sat < kMinEnergy) { setSkip(i, PdcSkip::SatSilent); continue; }
-        double norm_hub_total = 0.0;
-        for (int j = 0; j < hub_window_len; ++j) {
-            const double h = hub_window[static_cast<std::size_t>(j)];
-            norm_hub_total += h * h;
-        }
-        if (norm_hub_total < kMinEnergy) { setSkip(i, PdcSkip::HubSilent); continue; }
 
-        // GCC-PHAT cross-correlation. Time-domain correlation is brittle
-        // for non-percussive content because the peak is broad and easily
-        // dominated by spectral level differences. The Phase Transform
-        // whitens the cross-spectrum (each frequency bin contributes
-        // equally, only the *phase* alignment matters), yielding a much
-        // sharper, more reliable peak.
-        constexpr int kFftSize = 1 << kPdcFftOrder;  // must be ≥ N + 2*K
-        static_assert(kFftSize >= 16384, "FFT size must accommodate N + 2*K");
-
-        std::vector<std::complex<float>> sat_c(kFftSize, {0.0f, 0.0f});
-        std::vector<std::complex<float>> hub_c(kFftSize, {0.0f, 0.0f});
-
-        for (int j = 0; j < N; ++j)
-            sat_c[static_cast<std::size_t>(j)] = { sat_mono[static_cast<std::size_t>(j)], 0.0f };
-        for (int j = 0; j < hub_window_len; ++j)
-            hub_c[static_cast<std::size_t>(j)] = { hub_window[static_cast<std::size_t>(j)], 0.0f };
-
-        pdc_fft_.perform(sat_c.data(), sat_c.data(), false);
-        pdc_fft_.perform(hub_c.data(), hub_c.data(), false);
-
-        // Cross-spectrum with PHAT normalization, in place.
-        for (int bin = 0; bin < kFftSize; ++bin) {
-            const auto prod = sat_c[static_cast<std::size_t>(bin)]
-                            * std::conj(hub_c[static_cast<std::size_t>(bin)]);
-            const auto mag = std::abs(prod);
-            sat_c[static_cast<std::size_t>(bin)] = (mag > 1e-10f)
-                ? prod / mag
-                : std::complex<float>{ 0.0f, 0.0f };
-        }
-        pdc_fft_.perform(sat_c.data(), sat_c.data(), true);  // inverse
-
-        // The IFFT output's index n corresponds to the lag of sat_c vs
-        // hub_c. Because we placed sat at index 0 and hub at index 0,
-        // matching sat[j] = hub[j + L] requires lag L. The valid lag
-        // range (matching content alignment we wired with K offsets)
-        // is [0, hub_window_len - N] = [0, 2*K]. Peak there → D = L - K.
+        // Time-domain cross-correlation across lag k in [-K, K]. Sweep
+        // and track the peak. We tried FFT GCC-PHAT — yielded uniformly
+        // zero readings (the PHAT IFFT happened to peak right at L=K =
+        // "best_k=0" for every track regardless of true alignment),
+        // possibly because solo-cali's isolated content is *too* clean
+        // and the PHAT-whitened spectrum has no spectral discrimination.
+        // Time-domain XCorr empirically produced useful kick measurement
+        // before, so we stay with it.
         double max_abs    = 0.0;
-        double second_abs = 0.0;
-        int    best_L     = 0;
-        const int L_max = hub_window_len - N;  // = 2*K
-        for (int L = 0; L <= L_max; ++L) {
-            const double v = std::abs(sat_c[static_cast<std::size_t>(L)].real());
-            if (v > max_abs) {
-                second_abs = max_abs;
-                max_abs    = v;
-                best_L     = L;
-            } else if (v > second_abs) {
-                second_abs = v;
+        int    best_k     = 0;
+        for (int k = -K; k <= K; ++k) {
+            const int hub_offset = K + k;
+            double sum = 0.0;
+            for (int j = 0; j < N; ++j) {
+                sum += static_cast<double>(sat_mono[static_cast<std::size_t>(j)])
+                     * static_cast<double>(hub_window[static_cast<std::size_t>(hub_offset + j)]);
             }
+            const double absSum = std::abs(sum);
+            if (absSum > max_abs) { max_abs = absSum; best_k = k; }
         }
 
-        const int best_k = best_L - K;
-        // Confidence as peak-to-second-peak ratio, mapped to [0, 1].
-        // A perfectly clean PHAT correlation has max far above the
-        // sidelobes (ratio → ∞), giving confidence near 1; ambiguous
-        // matches have similar primary/secondary peaks (ratio → 1)
-        // giving confidence near 0.
-        const float conf = (max_abs > 1e-10)
-            ? static_cast<float>(1.0 - second_abs / max_abs)
-            : 0.0f;
+        double norm_hub = 0.0;
+        for (int j = 0; j < N; ++j) {
+            const double h = hub_window[static_cast<std::size_t>(K + best_k + j)];
+            norm_hub += h * h;
+        }
+        if (norm_hub < kMinEnergy) { setSkip(i, PdcSkip::HubSilent); continue; }
 
-        pdc_confidence_[i].store(conf, std::memory_order_relaxed);
+        const double normalized = max_abs / std::sqrt(norm_sat * norm_hub);
+        pdc_confidence_[i].store(static_cast<float>(normalized), std::memory_order_relaxed);
+
         pdc_d_samples_[i].store(static_cast<std::int64_t>(best_k),
                                  std::memory_order_relaxed);
         pdc_success_count_.fetch_add(1, std::memory_order_relaxed);
