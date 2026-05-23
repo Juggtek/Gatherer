@@ -416,12 +416,8 @@ void HubProcessor::pdcCalibratorTick() {
         }
         if (norm_hub < kMinEnergy) { setSkip(i, PdcSkip::HubSilent); continue; }
 
-        // Note: skipping the correlation-confidence gate for now — we always
-        // publish the peak lag so the user sees a number even when the peak
-        // is weak. (Re-introduce a confidence filter once the math is known
-        // to be correct.)
-        (void) std::sqrt(norm_sat * norm_hub);
-        (void) max_abs;
+        const double normalized = max_abs / std::sqrt(norm_sat * norm_hub);
+        pdc_confidence_[i].store(static_cast<float>(normalized), std::memory_order_relaxed);
 
         pdc_d_samples_[i].store(static_cast<std::int64_t>(best_k),
                                  std::memory_order_relaxed);

@@ -535,7 +535,11 @@ private:
     // a mono reference ring. The PdcCalibrator worker periodically cross-
     // correlates each active sat's SHM stream against this ring to estimate
     // per-sat D.
-    static constexpr std::uint32_t kPdcRefCapacity = 131072u;  // ~2.73s @ 48k, power of two
+    static constexpr std::uint32_t kPdcRefCapacity = 524288u;  // ~10.9s @ 48k, power of two
+                                                                // (big enough that clip-gated sats
+                                                                // whose last write was many seconds ago
+                                                                // can still be correlated against
+                                                                // recent hub data)
     gatherer::SpscRingBuffer::Header   pdc_ref_header_{};
     std::vector<float>                 pdc_ref_data_;  // size = kPdcRefCapacity, mono
     std::atomic<std::int64_t>          pdc_ref_anchor_host_frame_{ 0 };  // master frame at hub's first ref-ring write
@@ -570,8 +574,15 @@ public:
         if (slot < 0 || slot >= static_cast<int>(pdc_last_skip_.size())) return PdcSkip::SlotInactive;
         return static_cast<PdcSkip>(pdc_last_skip_[static_cast<std::size_t>(slot)].load(std::memory_order_relaxed));
     }
+    // Normalized correlation coefficient at the peak lag (0..1). Near 1 =
+    // strong match. Near 0 = no real match found (random noise peak).
+    float pdcConfidence(int slot) const noexcept {
+        if (slot < 0 || slot >= static_cast<int>(pdc_confidence_.size())) return 0.0f;
+        return pdc_confidence_[static_cast<std::size_t>(slot)].load(std::memory_order_relaxed);
+    }
 private:
     std::array<std::atomic<std::uint8_t>, gatherer::protocol::NUM_SLOTS> pdc_last_skip_{};
+    std::array<std::atomic<float>,        gatherer::protocol::NUM_SLOTS> pdc_confidence_{};
 
     class PdcCalibrator : public juce::Thread {
     public:

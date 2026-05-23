@@ -517,8 +517,11 @@ void HubEditor::timerCallback() {
             txt += "  s" + juce::String((int) i) + ":";
             const auto d = processor_.pdcDMeasured(static_cast<int>(i));
             if (d != HubProcessor::kPdcUnknown) {
-                const double ms = (sr > 0.0) ? (static_cast<double>(d) / sr) * 1000.0 : 0.0;
-                txt += juce::String((long long) d) + "s(" + juce::String(ms, 1) + "ms)";
+                const double ms   = (sr > 0.0) ? (static_cast<double>(d) / sr) * 1000.0 : 0.0;
+                const float  conf = processor_.pdcConfidence(static_cast<int>(i));
+                txt += juce::String((long long) d) + "s("
+                     + juce::String(ms, 1) + "ms@"
+                     + juce::String(conf, 2) + ")";
             } else {
                 txt += juce::String(skipName(processor_.pdcLastSkip(static_cast<int>(i))));
             }
