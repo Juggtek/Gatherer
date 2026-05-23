@@ -436,6 +436,8 @@ bool HubProcessor::measureOneSatSolo(int target_slot) {
     constexpr float kAudibleRms       = 1e-4f;  // ~ -80 dBFS
     constexpr int   kProbeFrames      = 4096;   // ~85ms @ 48k
     constexpr int   kInterMeasureMs   = 400;    // between successive measurements
+    constexpr int   kMaxMeasurements  = 10;     // cap takes per sat
+    constexpr int   kWaitAudibleTimeoutMs = 15000;  // bail if a sat never produces audio
 
     const auto t_start = juce::Time::getMillisecondCounter();
 
@@ -459,7 +461,7 @@ bool HubProcessor::measureOneSatSolo(int target_slot) {
 
     bool ever_heard         = false;
     int  measurement_count  = 0;
-    float best_conf          = 0.0f;
+    float best_conf         = 0.0f;
     std::int64_t best_d_samples = 0;
 
     while (true) {
@@ -477,13 +479,22 @@ bool HubProcessor::measureOneSatSolo(int target_slot) {
                 solo_cali_message_ = "Slot " + std::to_string(target_slot)
                                     + ": measuring (best conf "
                                     + std::to_string(static_cast<int>(best_conf * 100))
-                                    + "%, "
-                                    + std::to_string(measurement_count) + " takes, "
+                                    + "%, take "
+                                    + std::to_string(measurement_count) + "/"
+                                    + std::to_string(kMaxMeasurements) + ", "
                                     + std::to_string(elapsed / 1000) + "s)";
             }
         }
 
         if (!check_audible()) {
+            // No audio yet. Give up only if we've waited a long time and
+            // still haven't heard anything from this sat.
+            if (!ever_heard && elapsed > static_cast<std::uint32_t>(kWaitAudibleTimeoutMs)) {
+                const juce::ScopedLock sl(solo_cali_message_lock_);
+                solo_cali_message_ = "Slot " + std::to_string(target_slot)
+                                    + ": no audio detected, skipping.";
+                return false;
+            }
             juce::Thread::getCurrentThread()->wait(kPollIntervalMs);
             continue;
         }
@@ -503,17 +514,25 @@ bool HubProcessor::measureOneSatSolo(int target_slot) {
                               .load(std::memory_order_relaxed);
         const auto d    = pdc_d_samples_[static_cast<std::size_t>(target_slot)]
                               .load(std::memory_order_relaxed);
-        // Remember the best result so far.
         if (conf > best_conf) {
             best_conf      = conf;
             best_d_samples = d;
         }
 
-        if (conf >= kConfidentEnough) {
-            return true;
+        // Early exit on confident measurement.
+        if (conf >= kConfidentEnough) return true;
+
+        // Otherwise keep going up to the cap, then accept the best.
+        if (measurement_count >= kMaxMeasurements) {
+            // Make sure the best-so-far is the value the writer/UI sees,
+            // not whatever the last (possibly worse) measurement was.
+            pdc_d_samples_ [static_cast<std::size_t>(target_slot)]
+                .store(best_d_samples, std::memory_order_relaxed);
+            pdc_confidence_[static_cast<std::size_t>(target_slot)]
+                .store(best_conf, std::memory_order_relaxed);
+            return best_conf >= kConfidentEnough;
         }
 
-        // Not confident yet — wait a bit and try again.
         solo_cali_state_.store(static_cast<std::uint8_t>(SoloCaliState::Capturing),
                                 std::memory_order_release);
         juce::Thread::getCurrentThread()->wait(kInterMeasureMs);
