@@ -352,12 +352,29 @@ void HubProcessor::runSpikeCalibration() {
         return;
     }
 
+    // Find slots that are not just claimed (state == ACTIVE) but ALSO
+    // currently receiving processBlock callbacks. Slots can be in ACTIVE
+    // state but stale (host crashed without cleanup, slot reclaim window
+    // hasn't elapsed yet). The HealthMonitor flags these as "ghosts"; we
+    // must skip them or we'll wait 200ms per ghost while sat fails to
+    // ever set the spike_wp.
+    //
+    // Heartbeat liveness: snapshot sat_heartbeat, sleep briefly, snapshot
+    // again. If the counter advanced, sat is firing — include it.
+    std::array<std::uint32_t, gatherer::protocol::NUM_SLOTS> hb_before{};
+    for (std::uint32_t i = 0; i < gatherer::protocol::NUM_SLOTS; ++i) {
+        hb_before[i] = static_cast<std::uint32_t>(
+            region_->slots[i].sat_heartbeat.load(std::memory_order_relaxed));
+    }
+    juce::Thread::getCurrentThread()->wait(80);
     std::vector<int> active_slots;
     for (std::uint32_t i = 0; i < gatherer::protocol::NUM_SLOTS; ++i) {
         if (region_->slots[i].state.load(std::memory_order_acquire)
-            == gatherer::protocol::SLOT_STATE_ACTIVE) {
-            active_slots.push_back(static_cast<int>(i));
-        }
+            != gatherer::protocol::SLOT_STATE_ACTIVE) continue;
+        const auto hb_after = static_cast<std::uint32_t>(
+            region_->slots[i].sat_heartbeat.load(std::memory_order_relaxed));
+        if (hb_after == hb_before[i]) continue;  // ghost — no callbacks
+        active_slots.push_back(static_cast<int>(i));
     }
     solo_cali_total_    .store(static_cast<int>(active_slots.size()), std::memory_order_release);
     solo_cali_completed_.store(0, std::memory_order_release);
@@ -366,7 +383,7 @@ void HubProcessor::runSpikeCalibration() {
         solo_cali_state_.store(static_cast<std::uint8_t>(SoloCaliState::Failed),
                                 std::memory_order_release);
         const juce::ScopedLock sl(solo_cali_message_lock_);
-        solo_cali_message_ = "No active sats to calibrate.";
+        solo_cali_message_ = "No live sats to calibrate — press Play in the host first.";
         return;
     }
 
