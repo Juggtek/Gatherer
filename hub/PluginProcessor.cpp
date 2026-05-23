@@ -413,39 +413,90 @@ bool HubProcessor::measureOneSatSolo(int target_slot) {
         region_->slots[i].cali_mute_output.store(mute, std::memory_order_release);
     }
 
-    // Try up to 3 capture-then-correlate attempts. The first attempt waits
-    // 2 s so the sat almost certainly hits a clip burst even if it's
-    // sparsely played; subsequent attempts pick up additional content as
-    // playback advances. If any attempt yields a confident measurement
-    // we accept it.
-    constexpr int kAttempts          = 3;
-    constexpr int kFillMs_PerAttempt = 2000;
+    // Strategy: wait until the target sat actually produces audio (rather
+    // than measuring on a fixed schedule and getting noise from silent
+    // tracks). Once audible content appears, give it ~500ms more to fill
+    // the ref ring, then run a measurement tick. If confidence is high,
+    // we're done. Otherwise keep watching for more content up to the
+    // overall timeout.
+    //
+    // Timeout chosen so a track with content far away in the project
+    // still gets a chance, but a truly silent track doesn't stall
+    // calibration forever.
+    constexpr int  kTotalTimeoutMs  = 20000;
+    constexpr int  kPollIntervalMs  = 100;
+    constexpr int  kCaptureExtendMs = 500;
     constexpr float kConfidentEnough = 0.5f;
+    constexpr float kAudibleRms      = 1e-4f;  // ~ -80 dBFS
+    constexpr int   kProbeFrames     = 4096;   // ~85ms @ 48k
 
-    for (int attempt = 0; attempt < kAttempts; ++attempt) {
+    const auto t_start = juce::Time::getMillisecondCounter();
+
+    auto& slot = region_->slots[target_slot];
+    SpscRingBuffer rb(slot.ring_header, slot.ring_data, RING_FRAMES, RING_CHANNELS);
+
+    const auto wp_at_mute = rb.writePos();
+
+    std::vector<float> probe(static_cast<std::size_t>(kProbeFrames) * RING_CHANNELS);
+
+    auto check_audible = [&]() -> bool {
+        const auto wp = rb.writePos();
+        if (wp < wp_at_mute + static_cast<std::uint64_t>(kProbeFrames)) return false;
+        const auto start_pos = wp - static_cast<std::uint64_t>(kProbeFrames);
+        if (!rb.peekAt(start_pos, probe.data(), kProbeFrames)) return false;
+        double s = 0.0;
+        for (int i = 0; i < kProbeFrames * static_cast<int>(RING_CHANNELS); ++i) {
+            s += static_cast<double>(probe[i]) * probe[i];
+        }
+        const double rms = std::sqrt(s / (kProbeFrames * RING_CHANNELS));
+        return rms > kAudibleRms;
+    };
+
+    bool ever_heard = false;
+    int  measurement_attempts = 0;
+
+    while (true) {
+        if (!solo_cali_active_.load(std::memory_order_acquire)) return false;
+        const auto elapsed = juce::Time::getMillisecondCounter() - t_start;
+        if (elapsed > static_cast<std::uint32_t>(kTotalTimeoutMs)) break;
+
+        // Update status string.
         {
             const juce::ScopedLock sl(solo_cali_message_lock_);
             solo_cali_message_ = "Slot " + std::to_string(target_slot)
-                                + ": capturing... (attempt "
-                                + std::to_string(attempt + 1) + "/"
-                                + std::to_string(kAttempts) + ")";
+                                + (ever_heard ? ": measuring... " : ": waiting for audio... ")
+                                + "(" + std::to_string(elapsed / 1000) + "s)";
         }
-        juce::Thread::getCurrentThread()->wait(kFillMs_PerAttempt);
-        if (!solo_cali_active_.load(std::memory_order_acquire)) return false;
+
+        if (!check_audible()) {
+            juce::Thread::getCurrentThread()->wait(kPollIntervalMs);
+            continue;
+        }
+
+        if (!ever_heard) {
+            // First time we detect content. Let the ref ring accumulate
+            // a bit more before correlating so we have a long enough
+            // window for the cross-correlation.
+            ever_heard = true;
+            juce::Thread::getCurrentThread()->wait(kCaptureExtendMs);
+            if (!solo_cali_active_.load(std::memory_order_acquire)) return false;
+        }
 
         solo_cali_state_.store(static_cast<std::uint8_t>(SoloCaliState::Measuring),
                                 std::memory_order_release);
-
         pdcCalibratorTick();
+        ++measurement_attempts;
 
         const auto conf = pdc_confidence_[static_cast<std::size_t>(target_slot)]
                               .load(std::memory_order_relaxed);
         if (conf >= kConfidentEnough) return true;
 
-        // Move on to next attempt if there's a next one.
+        // Not confident yet — wait a bit more and try again with fresh content.
         solo_cali_state_.store(static_cast<std::uint8_t>(SoloCaliState::Capturing),
                                 std::memory_order_release);
+        juce::Thread::getCurrentThread()->wait(500);
     }
+
     return false;
 }
 
