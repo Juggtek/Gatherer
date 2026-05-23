@@ -370,6 +370,20 @@ void HubProcessor::runSpikeCalibration() {
         return;
     }
 
+    // Up-front check: transport must be playing for the calibration to
+    // work (sat plugins only fire processBlock during playback in
+    // clip-gated tracks, and hub's ref ring only captures audio while
+    // playing).
+    if (!last_seen_playing_.load(std::memory_order_acquire)) {
+        solo_cali_state_.store(static_cast<std::uint8_t>(SoloCaliState::Failed),
+                                std::memory_order_release);
+        const juce::ScopedLock sl(solo_cali_message_lock_);
+        solo_cali_message_ = "Transport is stopped — press Play in the host first, then click Calibrate.";
+        return;
+    }
+
+    int successes = 0;
+    std::string last_fail;
     for (int slot : active_slots) {
         if (!solo_cali_active_.load(std::memory_order_acquire)) break;  // cancelled
 
@@ -383,19 +397,31 @@ void HubProcessor::runSpikeCalibration() {
 
         const bool ok = measureOneSatSpike(slot);
         solo_cali_completed_.fetch_add(1, std::memory_order_release);
-        if (!ok) {
-            const juce::ScopedLock sl(solo_cali_message_lock_);
-            solo_cali_message_ = "Slot " + std::to_string(slot)
-                                + ": no spike found (transport stopped?).";
+        if (ok) {
+            ++successes;
+        } else {
+            last_fail = "Slot " + std::to_string(slot)
+                       + ": spike not detected. Track may not be receiving "
+                         "processBlock callbacks (clip-gated and silent?).";
         }
     }
 
-    solo_cali_state_  .store(static_cast<std::uint8_t>(SoloCaliState::Done),
-                              std::memory_order_release);
     solo_cali_current_.store(-1, std::memory_order_release);
-    {
+    if (successes > 0) {
+        solo_cali_state_.store(static_cast<std::uint8_t>(SoloCaliState::Done),
+                                std::memory_order_release);
         const juce::ScopedLock sl(solo_cali_message_lock_);
-        solo_cali_message_ = "Spike calibration complete.";
+        solo_cali_message_ = "Spike calibration: "
+                            + std::to_string(successes) + "/"
+                            + std::to_string(static_cast<int>(active_slots.size()))
+                            + " sats measured.";
+    } else {
+        solo_cali_state_.store(static_cast<std::uint8_t>(SoloCaliState::Failed),
+                                std::memory_order_release);
+        const juce::ScopedLock sl(solo_cali_message_lock_);
+        solo_cali_message_ = last_fail.empty()
+            ? "Calibration failed — no sats produced a measurable spike."
+            : last_fail;
     }
 }
 
