@@ -413,30 +413,40 @@ bool HubProcessor::measureOneSatSolo(int target_slot) {
         region_->slots[i].cali_mute_output.store(mute, std::memory_order_release);
     }
 
-    // Wait for the ref ring to fill with sat's isolated content. The ring is
-    // sized for ~10s; ~1s of soloed audio gives a clean cross-correlation
-    // without dragging out the procedure.
-    constexpr int kFillMs = 1200;
-    {
-        const juce::ScopedLock sl(solo_cali_message_lock_);
-        solo_cali_message_ = "Slot " + std::to_string(target_slot)
-                            + ": capturing isolated audio...";
+    // Try up to 3 capture-then-correlate attempts. The first attempt waits
+    // 2 s so the sat almost certainly hits a clip burst even if it's
+    // sparsely played; subsequent attempts pick up additional content as
+    // playback advances. If any attempt yields a confident measurement
+    // we accept it.
+    constexpr int kAttempts          = 3;
+    constexpr int kFillMs_PerAttempt = 2000;
+    constexpr float kConfidentEnough = 0.5f;
+
+    for (int attempt = 0; attempt < kAttempts; ++attempt) {
+        {
+            const juce::ScopedLock sl(solo_cali_message_lock_);
+            solo_cali_message_ = "Slot " + std::to_string(target_slot)
+                                + ": capturing... (attempt "
+                                + std::to_string(attempt + 1) + "/"
+                                + std::to_string(kAttempts) + ")";
+        }
+        juce::Thread::getCurrentThread()->wait(kFillMs_PerAttempt);
+        if (!solo_cali_active_.load(std::memory_order_acquire)) return false;
+
+        solo_cali_state_.store(static_cast<std::uint8_t>(SoloCaliState::Measuring),
+                                std::memory_order_release);
+
+        pdcCalibratorTick();
+
+        const auto conf = pdc_confidence_[static_cast<std::size_t>(target_slot)]
+                              .load(std::memory_order_relaxed);
+        if (conf >= kConfidentEnough) return true;
+
+        // Move on to next attempt if there's a next one.
+        solo_cali_state_.store(static_cast<std::uint8_t>(SoloCaliState::Capturing),
+                                std::memory_order_release);
     }
-    juce::Thread::getCurrentThread()->wait(kFillMs);
-    if (!solo_cali_active_.load(std::memory_order_acquire)) return false;
-
-    solo_cali_state_.store(static_cast<std::uint8_t>(SoloCaliState::Measuring),
-                            std::memory_order_release);
-
-    // Now run a single tick of the cross-correlator against the soloed mix.
-    // Since the ref ring contains only the target sat's content, the peak
-    // correlation should be near 1.0.
-    pdcCalibratorTick();
-
-    // Did we get a value with good confidence?
-    const auto conf = pdc_confidence_[static_cast<std::size_t>(target_slot)]
-                          .load(std::memory_order_relaxed);
-    return conf >= 0.5f;
+    return false;
 }
 
 // Cross-correlate each active sat's recent audio against the hub-input
