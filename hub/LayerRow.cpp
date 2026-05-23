@@ -240,13 +240,15 @@ void LayerRow::setLufs(float integrated, float momentary, float short_term) {
 }
 
 void LayerRow::setPdcState(long long measured_samples, long long override_samples,
-                            double sample_rate) {
+                            double sample_rate, float confidence) {
     if (measured_samples == pdc_measured_samples_
         && override_samples == pdc_override_samples_
-        && sample_rate == pdc_sample_rate_) return;
+        && sample_rate == pdc_sample_rate_
+        && std::abs(confidence - pdc_confidence_) < 1e-3f) return;
     pdc_measured_samples_ = measured_samples;
     pdc_override_samples_ = override_samples;
     pdc_sample_rate_      = sample_rate;
+    pdc_confidence_       = confidence;
     updatePdcLabel();
 }
 
@@ -261,7 +263,16 @@ void LayerRow::updatePdcLabel() {
     }
     const double ms = (static_cast<double>(shown_samp) / pdc_sample_rate_) * 1000.0;
     juce::String txt = "Latency: " + juce::String(ms, 2) + " ms";
-    if (has_override) txt += "  (manual)";
+    if (has_override) {
+        txt += "  (manual)";
+    } else {
+        // Auto-measured. Annotate with reliability.
+        constexpr float kGood    = 0.5f;
+        constexpr float kUsable  = 0.3f;
+        if (pdc_confidence_ >= kGood)        txt += "  (auto)";
+        else if (pdc_confidence_ >= kUsable) txt += "  (auto, ok)";
+        else                                 txt += "  (auto, noisy)";
+    }
     pdc_label_.setText(txt, juce::dontSendNotification);
 }
 

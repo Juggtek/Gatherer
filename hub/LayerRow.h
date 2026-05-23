@@ -41,7 +41,7 @@ public:
     // override.
     static constexpr long long kPdcUnknown = std::numeric_limits<long long>::min();
     void setPdcState(long long measured_samples, long long override_samples,
-                     double sample_rate);
+                     double sample_rate, float confidence);
 
     // Bind the waveform thumbnail (owned elsewhere).
     void setThumbnail(juce::AudioThumbnail* thumbnail) { lane_.setThumbnail(thumbnail); }
@@ -114,6 +114,7 @@ private:
     long long           pdc_measured_samples_ { kPdcUnknown };
     long long           pdc_override_samples_ { kPdcUnknown };
     double              pdc_sample_rate_      { 0.0 };
+    float               pdc_confidence_       { 0.0f };
     void                updatePdcLabel();
     juce::Slider        gain_slider_;
     LayerLane           lane_;

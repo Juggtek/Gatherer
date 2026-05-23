@@ -740,14 +740,15 @@ void HubEditor::timerCallback() {
         const auto lufs = processor_.getSlotLufs(s.slot_index);
         row_ptr->setLufs(lufs.integrated, lufs.momentary, lufs.short_term);
 
-        // Per-sat PDC state (auto-measured + user override).
+        // Per-sat PDC state (auto-measured + user override + confidence).
         {
             const auto m  = processor_.pdcDMeasured(s.slot_index);
             const auto ov = processor_.pdcDOverride(s.slot_index);
             row_ptr->setPdcState(
                 m  == HubProcessor::kPdcUnknown ? LayerRow::kPdcUnknown : static_cast<long long>(m),
                 ov == HubProcessor::kPdcUnknown ? LayerRow::kPdcUnknown : static_cast<long long>(ov),
-                processor_.getSampleRate());
+                processor_.getSampleRate(),
+                processor_.pdcConfidence(s.slot_index));
         }
 
         const auto rec_file = processor_.getLastRecordingForSlot(s.slot_index);

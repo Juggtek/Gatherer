@@ -265,12 +265,23 @@ public:
         return pdc_d_override_[static_cast<std::size_t>(slot)].load(std::memory_order_relaxed);
     }
     // Returns the value the writer/recorder should actually apply: override
-    // if set, else measured, else 0.
+    // if set, else measured (only if confident), else 0.
+    static constexpr float kPdcMinConfidence = 0.30f;
     std::int64_t pdcDEffective(int slot) const noexcept {
         const auto ov = pdcDOverride(slot);
         if (ov != kPdcUnknown) return ov;
         const auto m = pdcDMeasured(slot);
-        return (m == kPdcUnknown) ? 0 : m;
+        if (m == kPdcUnknown) return 0;
+        if (pdcConfidence(slot) < kPdcMinConfidence) return 0;
+        // Reject measurements pegged at the search boundary — those are
+        // almost always wrong (either no real peak, or true D is beyond
+        // the search range and we landed at the edge).
+        const auto abs_m = m < 0 ? -m : m;
+        // boundary equals the calibrator's K (~4096); we don't expose K
+        // publicly so use a conservative threshold here:
+        constexpr std::int64_t kBoundaryGuard = 4090;
+        if (abs_m >= kBoundaryGuard) return 0;
+        return m;
     }
     void setPdcDOverride(int slot, std::int64_t samples) noexcept {
         if (slot < 0 || slot >= static_cast<int>(pdc_d_override_.size())) return;
