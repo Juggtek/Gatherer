@@ -310,12 +310,9 @@ void HubProcessor::pdcCalibratorTick() {
     if (region_ == nullptr) return;
     if (!pdc_ref_anchor_set_.load(std::memory_order_acquire)) return;
 
-    constexpr int N = 2048;  // sat window length (~43ms @ 48k) — short enough to fit
-                             // inside one clip-gated burst (typical sampler clip ~ 100ms)
-    constexpr int K = 4096;  // ± lag search range (~85ms @ 48k) — covers typical PDC
-    constexpr double kMinCorrelation = 0.05;  // sat is one component of a mix —
-                                              // expected normalized corr ~= sqrt(sat_energy / mix_energy)
-                                              // which is small in busy mixes
+    constexpr int N = 1024;  // sat window length (~21ms @ 48k) — short enough to
+                             // fit inside a short sampler-clip burst (~50ms+)
+    constexpr int K = 2048;  // ± lag search range (~43ms @ 48k) — covers typical PDC
     constexpr double kMinEnergy      = 1e-6;
 
     const auto hub_anchor = pdc_ref_anchor_host_frame_.load(std::memory_order_relaxed);
