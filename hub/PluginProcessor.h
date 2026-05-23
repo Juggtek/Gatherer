@@ -581,6 +581,14 @@ private:
     std::vector<float>                 pdc_ref_data_;  // size = kPdcRefCapacity, mono
     std::atomic<std::int64_t>          pdc_ref_anchor_host_frame_{ 0 };  // master frame at hub's first ref-ring write
     std::atomic<bool>                  pdc_ref_anchor_set_{ false };
+    // Published every hub processBlock during playback: (master frame at
+    // start of that block, hub's wp value at start of that block). The
+    // anchor+wp method gives the wrong master time as soon as transport
+    // jumps/stops/restarts. This pair tells the worker thread "as of the
+    // most recent playing callback, hub_wp = X corresponded to master
+    // frame Y" — so the worker can interpolate backward for any recent wp.
+    std::atomic<std::int64_t>          pdc_latest_block_master_  { 0 };
+    std::atomic<std::uint64_t>         pdc_latest_block_wp_      { 0 };
 
     std::array<std::atomic<std::int64_t>, gatherer::protocol::NUM_SLOTS> pdc_d_samples_;
     std::array<std::atomic<std::int64_t>, gatherer::protocol::NUM_SLOTS> pdc_d_override_;

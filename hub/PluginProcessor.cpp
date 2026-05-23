@@ -426,8 +426,8 @@ void HubProcessor::runSpikeCalibration() {
             ++successes;
         } else {
             last_fail = "Slot " + std::to_string(slot)
-                       + ": spike not detected. Track may not be receiving "
-                         "processBlock callbacks (clip-gated and silent?).";
+                       + ": spike not detected — check that this track is "
+                         "currently producing audio (not clip-gated silent).";
         }
     }
 
@@ -517,11 +517,16 @@ bool HubProcessor::measureOneSatSpike(int target_slot) {
         return false;
     }
 
-    // Convert hub's spike position to master frame and diff against sat's
-    // directly-published master frame. The per-track output PDC delay =
-    // hub_master - sat_master.
-    const auto hub_anchor = pdc_ref_anchor_host_frame_.load(std::memory_order_relaxed);
-    const std::int64_t hub_master = static_cast<std::int64_t>(best_wp) + hub_anchor;
+    // Convert hub's spike position to master frame and diff against
+    // sat's directly-published master frame. Use the most recent
+    // (master, wp) pair published from hub's processBlock — this stays
+    // correct even when transport stops/restarts/jumps, unlike the
+    // hub_anchor + hub_wp approach.
+    const auto latest_wp     = pdc_latest_block_wp_    .load(std::memory_order_acquire);
+    const auto latest_master = pdc_latest_block_master_.load(std::memory_order_relaxed);
+    if (latest_wp == 0) return false;  // no playing block recorded yet
+    const std::int64_t hub_master =
+        latest_master + (static_cast<std::int64_t>(best_wp) - static_cast<std::int64_t>(latest_wp));
     const std::int64_t offset = hub_master - sat_spike_master;
 
     pdc_d_samples_[target_slot].store(offset, std::memory_order_relaxed);
@@ -586,6 +591,14 @@ void HubProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuff
             }
             pdc_ref_header_.write_pos.store(wp_before + static_cast<std::uint64_t>(frames),
                                              std::memory_order_release);
+
+            // Publish (master frame, hub_wp) for this block so the cali
+            // worker can map any hub_wp to a master frame even when
+            // transport has jumped or anchor is stale. Master first
+            // (with relaxed), then wp (with release) so a worker that
+            // does acquire-load on wp sees a matching master.
+            pdc_latest_block_master_.store(hfs_at_block_start, std::memory_order_relaxed);
+            pdc_latest_block_wp_    .store(wp_before, std::memory_order_release);
 
             if (!pdc_ref_anchor_set_.load(std::memory_order_relaxed)) {
                 pdc_ref_anchor_host_frame_.store(hfs_at_block_start, std::memory_order_relaxed);
