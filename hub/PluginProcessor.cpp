@@ -1153,21 +1153,24 @@ bool HubProcessor::actuallyStartRecording() {
         a.thumbnail        = thumbnails_[i].get();
 
         // Apply per-sat PDC compensation. The cross-correlator measured D
-        // such that sat's content at sat_wp = X is for music (master + D).
-        // To put music at master time T at the WAV frame for T (= frame
-        // (T - recording_start_master)), the writer must read sat's ring
-        // D samples *earlier* than the naive snapshot wp. D > 0 (sat
-        // pre-rolled by a latent sampler upstream) → start_wp shifts back.
+        // such that sat's content at sat_wp X represents music master_at_X
+        // shifted by D in music time. To make the WAV's frame F hold music
+        // (recording_start + F), the writer must read sat at sat_wp =
+        // snap_wp - D (signed). D > 0 → read earlier (sat is ahead, e.g.
+        // pre-roll); D < 0 → read later (sat is behind, need to wait for
+        // sat to catch up).
         const auto snap_wp = recording_start_wp_[i].load(std::memory_order_acquire);
         const auto d_samples = pdcDEffective(static_cast<int>(i));
-        // Clamp to the ring's reachable history: at any wp, the ring holds
-        // the most recent RING_FRAMES samples. Reading further back returns
-        // nothing usable (peekAt would fail).
-        std::int64_t d_clamped = d_samples;
-        const std::int64_t max_back = static_cast<std::int64_t>(gatherer::protocol::RING_FRAMES) - 1;
-        if (d_clamped > max_back) d_clamped = max_back;
-        if (d_clamped > static_cast<std::int64_t>(snap_wp)) d_clamped = static_cast<std::int64_t>(snap_wp);
-        a.start_wp         = snap_wp - static_cast<std::uint64_t>(d_clamped > 0 ? d_clamped : 0);
+        const std::int64_t snap_signed = static_cast<std::int64_t>(snap_wp);
+        std::int64_t shifted = snap_signed - d_samples;
+        // Clamp to valid ring positions:
+        //   * never below 0
+        //   * never more than RING_FRAMES-1 *behind* snap_wp (we can't read
+        //     older data than the ring holds)
+        const std::int64_t min_allowed = std::max<std::int64_t>(
+            0, snap_signed - (static_cast<std::int64_t>(gatherer::protocol::RING_FRAMES) - 1));
+        if (shifted < min_allowed) shifted = min_allowed;
+        a.start_wp         = static_cast<std::uint64_t>(shifted);
         a.expected_samples = pad ? &expected_samples_[i] : nullptr;
         armed.push_back(a);
     }
