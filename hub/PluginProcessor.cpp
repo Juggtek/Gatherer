@@ -371,9 +371,17 @@ void HubProcessor::runSpikeCalibration() {
     for (std::uint32_t i = 0; i < gatherer::protocol::NUM_SLOTS; ++i) {
         if (region_->slots[i].state.load(std::memory_order_acquire)
             != gatherer::protocol::SLOT_STATE_ACTIVE) continue;
+        // Must have a non-zero UUID — slot reclaim sometimes leaves
+        // SLOT_STATE_ACTIVE flagged briefly with sat_uuid=0.
+        if (region_->slots[i].sat_uuid.load(std::memory_order_relaxed) == 0) continue;
         const auto hb_after = static_cast<std::uint32_t>(
             region_->slots[i].sat_heartbeat.load(std::memory_order_relaxed));
-        if (hb_after == hb_before[i]) continue;  // ghost — no callbacks
+        // Heartbeat must have advanced AT LEAST a few times in 80ms (a
+        // live sat at typical buffer sizes fires ~50-500 times/sec, so
+        // ≥4 in 80ms is a conservative floor). This catches the case
+        // where a defunct sat plugin's thread occasionally bumps the
+        // heartbeat as it gets torn down.
+        if (hb_after - hb_before[i] < 4) continue;
         active_slots.push_back(static_cast<int>(i));
     }
     solo_cali_total_    .store(static_cast<int>(active_slots.size()), std::memory_order_release);
@@ -451,12 +459,13 @@ bool HubProcessor::measureOneSatSpike(int target_slot) {
     if (pdc_ref_data_.empty()) return false;
     if (!pdc_ref_anchor_set_.load(std::memory_order_acquire)) return false;
 
-    // Trigger spike injection. Sat will fire on its next processBlock,
-    // overwrite the first 4 samples of its output buffer with the
-    // pattern (+1, -1, +1, -1), write the same to SHM, and publish the
-    // wp where it wrote the spike via slot.spike_wp.
-    slot.spike_wp.store(0, std::memory_order_release);
-    slot.inject_spike.store(1u, std::memory_order_release);
+    // Trigger spike injection. Sat will fire on its next processBlock
+    // (only when transport is playing), inject the pattern (+1, -1, +1,
+    // -1) into both its output buffer and SHM ring, and publish the
+    // master frame at which the spike landed via spike_master_frame.
+    slot.spike_wp           .store(0, std::memory_order_release);
+    slot.spike_master_frame .store(0, std::memory_order_release);
+    slot.inject_spike       .store(1u, std::memory_order_release);
 
     // Wait long enough for: sat to fire its next callback, hub to
     // capture that callback (and several subsequent ones, so the spike
@@ -464,10 +473,11 @@ bool HubProcessor::measureOneSatSpike(int target_slot) {
     juce::Thread::getCurrentThread()->wait(250);
     if (!solo_cali_active_.load(std::memory_order_acquire)) return false;
 
-    const auto sat_spike_wp = slot.spike_wp.load(std::memory_order_acquire);
-    if (sat_spike_wp == 0) {
-        // Sat never fired (silent track? transport stopped right after
-        // we set the flag?). Clear the flag and report failure.
+    const auto sat_spike_wp      = slot.spike_wp.load(std::memory_order_acquire);
+    const auto sat_spike_master  = slot.spike_master_frame.load(std::memory_order_acquire);
+    if (sat_spike_wp == 0 || sat_spike_master == 0) {
+        // Sat never fired with a valid playhead (silent track? transport
+        // stopped right after we set the flag?). Clear and fail.
         slot.inject_spike.store(0u, std::memory_order_release);
         return false;
     }
@@ -507,13 +517,12 @@ bool HubProcessor::measureOneSatSpike(int target_slot) {
         return false;
     }
 
-    // Convert both sat-side and hub-side spike wps to master frames and
-    // diff. The per-track output PDC delay = hub_master - sat_master.
-    const auto sat_anchor = slot.anchor_host_frame.load(std::memory_order_acquire);
+    // Convert hub's spike position to master frame and diff against sat's
+    // directly-published master frame. The per-track output PDC delay =
+    // hub_master - sat_master.
     const auto hub_anchor = pdc_ref_anchor_host_frame_.load(std::memory_order_relaxed);
     const std::int64_t hub_master = static_cast<std::int64_t>(best_wp) + hub_anchor;
-    const std::int64_t sat_master = static_cast<std::int64_t>(sat_spike_wp) + sat_anchor;
-    const std::int64_t offset = hub_master - sat_master;
+    const std::int64_t offset = hub_master - sat_spike_master;
 
     pdc_d_samples_[target_slot].store(offset, std::memory_order_relaxed);
     pdc_confidence_[target_slot].store(static_cast<float>(std::min(1.0, best_score / 4.0)),

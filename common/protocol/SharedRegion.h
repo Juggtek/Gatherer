@@ -98,13 +98,16 @@ struct SatelliteSlot {
     // track output delay that the DAW applies. Sat clears the flag back
     // to 0 after firing once.
     std::atomic<std::uint32_t> inject_spike;         // 0 = idle, 1 = inject on next block
-    // Sat records the wp at which it wrote the spike, so hub knows exactly
-    // where to look in sat's SHM ring without searching.
+    // Sat records the wp at which it wrote the spike (for cleanup later)
+    // AND the master playhead frame at injection time (for the actual
+    // offset calculation — sat_wp ≠ master frame because sat fires on
+    // every callback regardless of transport state).
     std::atomic<std::uint64_t> spike_wp;
+    std::atomic<std::int64_t>  spike_master_frame;
 
     float                      ring_data[RING_FRAMES * RING_CHANNELS];
 
-    std::uint8_t               reserved[220];
+    std::uint8_t               reserved[212];
 };
 
 struct SharedRegion {

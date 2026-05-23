@@ -187,28 +187,40 @@ void SatelliteProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mi
     // SHM ring (so hub can locate the spike from sat's side too). The
     // difference between sat's spike wp and hub's input wp at which the
     // spike appears equals the per-track output delay.
+    // Read playhead for both PDC bookkeeping and (if needed) spike injection.
+    std::int64_t hfs_at_block_start = 0;
+    bool         pb_playing         = false;
+    bool         pb_have_frame      = false;
+    if (auto* ph = getPlayHead()) {
+        if (auto pos = ph->getPosition()) {
+            pb_playing = pos->getIsPlaying();
+            if (auto t = pos->getTimeInSamples()) {
+                hfs_at_block_start = *t;
+                pb_have_frame = true;
+            }
+        }
+    }
+
     bool injected = false;
-    if (region_ != nullptr && frames >= 4) {
+    if (region_ != nullptr && frames >= 4 && pb_playing && pb_have_frame) {
         const int idx = slot_index_.load(std::memory_order_acquire);
         if (idx >= 0 && idx < static_cast<int>(gatherer::protocol::NUM_SLOTS)) {
             auto& slot = region_->slots[idx];
             std::uint32_t want = 1u;
             if (slot.inject_spike.compare_exchange_strong(want, 0u,
                                                             std::memory_order_acq_rel)) {
-                // Pattern engineered to be: (a) unambiguous against typical
-                // audio (alternating +1/-1 won't occur naturally), (b) sharp
-                // enough that finding its peak doesn't require correlation.
                 const float pat[4] = { 1.0f, -1.0f, 1.0f, -1.0f };
                 for (int ch = 0; ch < buffer.getNumChannels(); ++ch) {
                     auto* w = buffer.getWritePointer(ch);
                     for (int i = 0; i < 4; ++i) w[i] = pat[i];
                 }
-                // Record the wp at which sat is about to write the spike.
-                // writeInterleavedToRing below writes `frames` frames
-                // starting at sat's current wp. So the spike (first 4 samples)
-                // lands at the *current* wp.
                 SpscRingBuffer rb_wp(slot.ring_header, slot.ring_data, RING_FRAMES, RING_CHANNELS);
-                slot.spike_wp.store(rb_wp.writePos(), std::memory_order_release);
+                slot.spike_wp          .store(rb_wp.writePos(), std::memory_order_release);
+                // Spike lands at the start of this block, so its master
+                // frame is `hfs_at_block_start`. Publishing this directly
+                // avoids the sat_anchor + wp mapping which drifts when sat
+                // fires off-transport callbacks.
+                slot.spike_master_frame.store(hfs_at_block_start, std::memory_order_release);
                 injected = true;
             }
         }
