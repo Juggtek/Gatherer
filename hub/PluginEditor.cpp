@@ -201,14 +201,21 @@ HubEditor::HubEditor(HubProcessor& p)
                               juce::Colours::yellow.withAlpha(0.85f));
     addAndMakeVisible(pdc_diag_label_);
 
-    calibrate_button_.setTooltip("Run an active probe: hub posts a calibration session, "
-                                 "each sat snapshots (hub_heartbeat, write_pos) when it "
-                                 "sees the session, hub compares snapshots. Detects "
-                                 "callback-level misalignment with sample accuracy.");
+    calibrate_button_.setTooltip(
+        "Measure per-track PDC by soloing each sat in turn. Hub mutes "
+        "every sat's output except the one being measured, isolating that "
+        "sat's content in the parent-bus mix, then cross-correlates the "
+        "isolated mix against sat's SHM stream for a clean sample-accurate "
+        "D. Repeats for every active sat. Transport must be playing. Takes "
+        "~1-2 seconds per sat.");
     calibrate_button_.onClick = [this] {
+        // Trigger BOTH the legacy callback-level probe (for the existing
+        // green/red badge) and the new solo PDC sweep.
         processor_.startCalibration();
+        processor_.startSoloCalibration();
         calibrate_summary_.setText("Calibrating...", juce::dontSendNotification);
-        calibrate_detail_.setText("Recording satellite responses...", juce::dontSendNotification);
+        calibrate_detail_.setText("Starting solo PDC calibration...",
+                                   juce::dontSendNotification);
         calibrate_badge_color_ = juce::Colours::lightgrey;
         repaint();
     };
@@ -588,13 +595,40 @@ void HubEditor::timerCallback() {
 
     // Drive the calibration probe.
     processor_.finishCalibrationIfReady();
-    const auto cal = processor_.lastCalibrationResult();
-    if (processor_.calibrationInProgress()) {
+    const auto cal       = processor_.lastCalibrationResult();
+    const auto solo_cali = processor_.soloCaliStatus();
+    const bool solo_in_progress =
+        solo_cali.state == HubProcessor::SoloCaliState::Capturing
+     || solo_cali.state == HubProcessor::SoloCaliState::Measuring;
+
+    if (processor_.calibrationInProgress() || solo_in_progress) {
         calibrate_badge_color_ = juce::Colours::lightgrey;
         calibrate_button_.setEnabled(false);
+        if (solo_in_progress) {
+            calibrate_summary_.setText(
+                "Solo PDC: slot " + juce::String(solo_cali.current_slot)
+                + " (" + juce::String(solo_cali.completed_slots)
+                + "/" + juce::String(solo_cali.total_slots) + ")",
+                juce::dontSendNotification);
+            calibrate_detail_.setText(juce::String(solo_cali.message),
+                                       juce::dontSendNotification);
+        }
     } else {
         calibrate_button_.setEnabled(true);
-        if (cal.valid) {
+        if (solo_cali.state == HubProcessor::SoloCaliState::Done
+            || solo_cali.state == HubProcessor::SoloCaliState::Failed) {
+            calibrate_badge_color_ =
+                solo_cali.state == HubProcessor::SoloCaliState::Done
+                    ? juce::Colours::limegreen
+                    : juce::Colours::indianred;
+            calibrate_summary_.setText(
+                solo_cali.state == HubProcessor::SoloCaliState::Done
+                    ? "Solo PDC calibration complete"
+                    : "Solo PDC calibration failed",
+                juce::dontSendNotification);
+            calibrate_detail_.setText(juce::String(solo_cali.message),
+                                       juce::dontSendNotification);
+        } else if (cal.valid) {
             calibrate_badge_color_ = cal.passed ? juce::Colours::limegreen
                                                 : juce::Colours::indianred;
             calibrate_summary_.setText(juce::String(cal.summary), juce::dontSendNotification);

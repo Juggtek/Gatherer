@@ -180,6 +180,18 @@ void SatelliteProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mi
     juce::ScopedNoDenormals noDenormals;
     const int frames = buffer.getNumSamples();
     writeInterleavedToRing(buffer, frames);
+    // Honor hub's PDC-calibration solo request: while cali_mute_output is set
+    // this sat clears its passthrough output, removing itself from Bitwig's
+    // parent-bus mix so hub can isolate a different sat. Sat's SHM ring is
+    // unaffected — hub still receives the captured audio there.
+    if (region_ != nullptr) {
+        const int idx = slot_index_.load(std::memory_order_acquire);
+        if (idx >= 0 && idx < static_cast<int>(gatherer::protocol::NUM_SLOTS)) {
+            if (region_->slots[idx].cali_mute_output.load(std::memory_order_acquire) != 0u) {
+                buffer.clear();
+            }
+        }
+    }
     // Pass-through: leave buffer untouched.
 }
 

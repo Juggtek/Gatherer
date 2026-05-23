@@ -295,9 +295,148 @@ void HubProcessor::lufsWorkerTick() {
 
 void HubProcessor::PdcCalibrator::run() {
     while (!threadShouldExit()) {
-        processor_.pdcCalibratorTick();
-        wait(500);  // ~2Hz — D doesn't change at runtime, polling slowly is fine
+        if (processor_.solo_cali_active_.load(std::memory_order_acquire)) {
+            processor_.runSoloCalibration();
+            // runSoloCalibration completes a full sequence; clear the trigger.
+            processor_.solo_cali_active_.store(false, std::memory_order_release);
+        } else {
+            processor_.pdcCalibratorTick();
+        }
+        wait(200);
     }
+}
+
+void HubProcessor::startSoloCalibration() {
+    // Idempotent: only allow start if not already in progress.
+    bool expected = false;
+    if (!solo_cali_active_.compare_exchange_strong(expected, true,
+                                                    std::memory_order_acq_rel)) {
+        return;
+    }
+    solo_cali_state_.store(static_cast<std::uint8_t>(SoloCaliState::Capturing),
+                            std::memory_order_release);
+    {
+        const juce::ScopedLock sl(solo_cali_message_lock_);
+        solo_cali_message_ = "Starting solo calibration...";
+    }
+}
+
+void HubProcessor::cancelSoloCalibration() {
+    solo_cali_active_.store(false, std::memory_order_release);
+}
+
+HubProcessor::SoloCaliStatus HubProcessor::soloCaliStatus() const noexcept {
+    SoloCaliStatus s;
+    s.state           = static_cast<SoloCaliState>(solo_cali_state_.load(std::memory_order_relaxed));
+    s.current_slot    = solo_cali_current_  .load(std::memory_order_relaxed);
+    s.total_slots     = solo_cali_total_    .load(std::memory_order_relaxed);
+    s.completed_slots = solo_cali_completed_.load(std::memory_order_relaxed);
+    {
+        const juce::ScopedLock sl(const_cast<juce::CriticalSection&>(solo_cali_message_lock_));
+        s.message = solo_cali_message_;
+    }
+    return s;
+}
+
+// Iterates every active slot, soloes it by muting all other sats via the
+// cali_mute_output SHM flag, lets the ref ring fill with ~600 ms of the
+// isolated sat's content, then cross-correlates. Each measurement updates
+// pdc_d_samples_ for that slot.
+void HubProcessor::runSoloCalibration() {
+    if (region_ == nullptr || !is_hub_) {
+        solo_cali_state_.store(static_cast<std::uint8_t>(SoloCaliState::Failed),
+                                std::memory_order_release);
+        const juce::ScopedLock sl(solo_cali_message_lock_);
+        solo_cali_message_ = "Hub not active.";
+        return;
+    }
+
+    std::vector<int> active_slots;
+    for (std::uint32_t i = 0; i < gatherer::protocol::NUM_SLOTS; ++i) {
+        if (region_->slots[i].state.load(std::memory_order_acquire)
+            == gatherer::protocol::SLOT_STATE_ACTIVE) {
+            active_slots.push_back(static_cast<int>(i));
+        }
+    }
+    solo_cali_total_    .store(static_cast<int>(active_slots.size()), std::memory_order_release);
+    solo_cali_completed_.store(0, std::memory_order_release);
+
+    if (active_slots.empty()) {
+        solo_cali_state_.store(static_cast<std::uint8_t>(SoloCaliState::Failed),
+                                std::memory_order_release);
+        const juce::ScopedLock sl(solo_cali_message_lock_);
+        solo_cali_message_ = "No active sats to calibrate.";
+        return;
+    }
+
+    for (int slot : active_slots) {
+        if (!solo_cali_active_.load(std::memory_order_acquire)) break;  // cancelled
+
+        solo_cali_current_.store(slot, std::memory_order_release);
+        solo_cali_state_  .store(static_cast<std::uint8_t>(SoloCaliState::Capturing),
+                                  std::memory_order_release);
+        {
+            const juce::ScopedLock sl(solo_cali_message_lock_);
+            solo_cali_message_ = "Calibrating slot " + std::to_string(slot) + "...";
+        }
+
+        const bool ok = measureOneSatSolo(slot);
+
+        solo_cali_completed_.fetch_add(1, std::memory_order_release);
+        if (!ok) {
+            const juce::ScopedLock sl(solo_cali_message_lock_);
+            solo_cali_message_ = "Slot " + std::to_string(slot)
+                                + ": could not measure (sat silent or low correlation).";
+        }
+    }
+
+    // Always restore: clear every cali_mute_output flag we touched.
+    for (std::uint32_t i = 0; i < gatherer::protocol::NUM_SLOTS; ++i) {
+        region_->slots[i].cali_mute_output.store(0u, std::memory_order_release);
+    }
+
+    solo_cali_state_  .store(static_cast<std::uint8_t>(SoloCaliState::Done),
+                              std::memory_order_release);
+    solo_cali_current_.store(-1, std::memory_order_release);
+    {
+        const juce::ScopedLock sl(solo_cali_message_lock_);
+        solo_cali_message_ = "Solo calibration complete.";
+    }
+}
+
+bool HubProcessor::measureOneSatSolo(int target_slot) {
+    if (region_ == nullptr) return false;
+
+    // Mute all sats except target.
+    for (std::uint32_t i = 0; i < gatherer::protocol::NUM_SLOTS; ++i) {
+        const std::uint32_t mute = (static_cast<int>(i) == target_slot) ? 0u : 1u;
+        region_->slots[i].cali_mute_output.store(mute, std::memory_order_release);
+    }
+
+    // Wait for the ref ring to fill with sat's isolated content. The ring is
+    // sized for ~10s; ~1s of soloed audio gives a clean cross-correlation
+    // without dragging out the procedure.
+    constexpr int kFillMs = 1200;
+    {
+        const juce::ScopedLock sl(solo_cali_message_lock_);
+        solo_cali_message_ = "Slot " + std::to_string(target_slot)
+                            + ": capturing isolated audio...";
+    }
+    juce::Thread::getCurrentThread()->wait(kFillMs);
+    if (!solo_cali_active_.load(std::memory_order_acquire)) return false;
+
+    solo_cali_state_.store(static_cast<std::uint8_t>(SoloCaliState::Measuring),
+                            std::memory_order_release);
+
+    // Now run a single tick of the cross-correlator against the soloed mix.
+    // Since the ref ring contains only the target sat's content, the peak
+    // correlation should be near 1.0.
+    pdcCalibratorTick();
+
+    // Did we get a value with good confidence?
+    const auto conf = pdc_confidence_[static_cast<std::size_t>(target_slot)]
+                          .load(std::memory_order_relaxed);
+    return conf >= 0.5f;
 }
 
 // Cross-correlate each active sat's recent audio against the hub-input

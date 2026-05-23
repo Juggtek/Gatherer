@@ -301,6 +301,23 @@ public:
     }
     static constexpr std::int64_t kPdcUnknown = std::numeric_limits<std::int64_t>::min();
 
+    // Per-sat solo-calibration: hub iterates active sats, mutes every sat's
+    // output except the one being measured, lets the ref ring fill with the
+    // isolated sat's content, then cross-correlates. Triggered by the
+    // Calibrate button when transport is playing. State is published so the
+    // UI can show a progress indicator.
+    void startSoloCalibration();
+    void cancelSoloCalibration();
+    enum class SoloCaliState : std::uint8_t { Idle, Capturing, Measuring, Done, Failed };
+    struct SoloCaliStatus {
+        SoloCaliState state             = SoloCaliState::Idle;
+        int           current_slot      = -1;
+        int           total_slots       = 0;
+        int           completed_slots   = 0;
+        std::string   message;
+    };
+    SoloCaliStatus soloCaliStatus() const noexcept;
+
     // True when this AudioProcessor is being hosted by JUCE's standalone wrapper
     // (`Gatherer Hub.app`) rather than a DAW. Editors use it to choose deployment-
     // specific defaults / UI hints.
@@ -613,4 +630,16 @@ private:
     };
     std::unique_ptr<PdcCalibrator> pdc_calibrator_;
     void pdcCalibratorTick();
+
+    // Solo-calibration state (driven by PdcCalibrator's run loop when
+    // `solo_cali_active_` is set).
+    std::atomic<bool>            solo_cali_active_      { false };
+    std::atomic<int>             solo_cali_current_     { -1 };  // slot index currently being measured
+    std::atomic<int>             solo_cali_total_       { 0 };
+    std::atomic<int>             solo_cali_completed_   { 0 };
+    std::atomic<std::uint8_t>    solo_cali_state_       { static_cast<std::uint8_t>(SoloCaliState::Idle) };
+    juce::CriticalSection        solo_cali_message_lock_;
+    std::string                  solo_cali_message_;
+    void runSoloCalibration();
+    bool measureOneSatSolo(int slot);
 };
