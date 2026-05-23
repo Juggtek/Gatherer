@@ -266,12 +266,12 @@ void LayerRow::updatePdcLabel() {
     if (has_override) {
         txt += "  (manual)";
     } else {
-        // Auto-measured. Annotate with reliability.
-        constexpr float kGood    = 0.5f;
-        constexpr float kUsable  = 0.3f;
-        if (pdc_confidence_ >= kGood)        txt += "  (auto)";
-        else if (pdc_confidence_ >= kUsable) txt += "  (auto, ok)";
-        else                                 txt += "  (auto, noisy)";
+        // Auto-measured. Annotate with reliability. Threshold matches
+        // HubProcessor::kPdcMinConfidence (= 0.70) — below this, the
+        // value is NOT applied to recordings; user should set a manual
+        // override if they want compensation on this track.
+        if (pdc_confidence_ >= 0.70f)        txt += "  (auto, applied)";
+        else                                 txt += "  (auto, noisy — not applied)";
     }
     pdc_label_.setText(txt, juce::dontSendNotification);
 }

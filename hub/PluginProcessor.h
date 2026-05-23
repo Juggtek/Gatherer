@@ -265,8 +265,16 @@ public:
         return pdc_d_override_[static_cast<std::size_t>(slot)].load(std::memory_order_relaxed);
     }
     // Returns the value the writer/recorder should actually apply: override
-    // if set, else measured (only if confident), else 0.
-    static constexpr float kPdcMinConfidence = 0.30f;
+    // if set, else measured (only if VERY confident), else 0.
+    //
+    // The threshold is intentionally high (0.7) because cross-correlation
+    // against a busy mix is noisy: spurious peaks routinely land between
+    // 0.2-0.5. Applying a wrong D makes recordings strictly worse than no
+    // compensation, so we only apply when the peak is unambiguous. Users
+    // with tracks that the auto-measurement can't reach (sustained pads,
+    // quiet content, short clips) can set the override manually from
+    // their DAW's reported per-track latency.
+    static constexpr float kPdcMinConfidence = 0.70f;
     std::int64_t pdcDEffective(int slot) const noexcept {
         const auto ov = pdcDOverride(slot);
         if (ov != kPdcUnknown) return ov;
