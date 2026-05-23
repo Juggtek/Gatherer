@@ -632,6 +632,14 @@ private:
     std::unique_ptr<PdcCalibrator> pdc_calibrator_;
     void pdcCalibratorTick();
 
+    // GCC-PHAT FFT engine. The Phase Transform whitens the cross-spectrum
+    // before the inverse FFT, producing a much sharper correlation peak
+    // than time-domain XCorr for the same data — particularly helpful for
+    // sustained/tonal content where time-domain correlation is mushy. FFT
+    // size must be ≥ N + 2*K and a power of two.
+    static constexpr int kPdcFftOrder = 14;  // 2^14 = 16384 — fits N=1024 + 2*K=8192
+    juce::dsp::FFT pdc_fft_ { kPdcFftOrder };
+
     // Solo-calibration state (driven by PdcCalibrator's run loop when
     // `solo_cali_active_` is set).
     std::atomic<bool>            solo_cali_active_      { false };
