@@ -413,30 +413,35 @@ bool HubProcessor::measureOneSatSolo(int target_slot) {
         region_->slots[i].cali_mute_output.store(mute, std::memory_order_release);
     }
 
-    // Strategy: wait until the target sat actually produces audio (rather
-    // than measuring on a fixed schedule and getting noise from silent
-    // tracks). Once audible content appears, give it ~500ms more to fill
-    // the ref ring, then run a measurement tick. If confidence is high,
-    // we're done. Otherwise keep watching for more content up to the
-    // overall timeout.
+    // Strategy: stay on this sat indefinitely until we have a confident
+    // measurement. No fixed timeout — user cancels via the Calibrate
+    // button if a track has no audio in the project.
     //
-    // Timeout chosen so a track with content far away in the project
-    // still gets a chance, but a truly silent track doesn't stall
-    // calibration forever.
-    constexpr int  kTotalTimeoutMs  = 20000;
-    constexpr int  kPollIntervalMs  = 100;
-    constexpr int  kCaptureExtendMs = 500;
-    constexpr float kConfidentEnough = 0.5f;
-    constexpr float kAudibleRms      = 1e-4f;  // ~ -80 dBFS
-    constexpr int   kProbeFrames     = 4096;   // ~85ms @ 48k
+    // Per iteration:
+    //   1. Poll sat's ring for audible content (RMS above floor).
+    //   2. When content appears, wait briefly so the ref ring fills, then
+    //      run pdcCalibratorTick() to cross-correlate.
+    //   3. Track the best confidence so far. If we beat it, remember the
+    //      value. Repeat until confidence ≥ 0.5 or 5 confident
+    //      measurements have converged (median).
+    //
+    // This is event-driven (we wait until audio is actually present)
+    // and progress-tracked, so the UI can show "waiting for audio (8s)"
+    // when a track is sparse, vs "measured 3 of 5 stable readings" when
+    // we're getting close.
+
+    constexpr int   kPollIntervalMs   = 100;
+    constexpr int   kCaptureExtendMs  = 500;
+    constexpr float kConfidentEnough  = 0.5f;
+    constexpr float kAudibleRms       = 1e-4f;  // ~ -80 dBFS
+    constexpr int   kProbeFrames      = 4096;   // ~85ms @ 48k
+    constexpr int   kInterMeasureMs   = 400;    // between successive measurements
 
     const auto t_start = juce::Time::getMillisecondCounter();
 
     auto& slot = region_->slots[target_slot];
     SpscRingBuffer rb(slot.ring_header, slot.ring_data, RING_FRAMES, RING_CHANNELS);
-
     const auto wp_at_mute = rb.writePos();
-
     std::vector<float> probe(static_cast<std::size_t>(kProbeFrames) * RING_CHANNELS);
 
     auto check_audible = [&]() -> bool {
@@ -452,20 +457,30 @@ bool HubProcessor::measureOneSatSolo(int target_slot) {
         return rms > kAudibleRms;
     };
 
-    bool ever_heard = false;
-    int  measurement_attempts = 0;
+    bool ever_heard         = false;
+    int  measurement_count  = 0;
+    float best_conf          = 0.0f;
+    std::int64_t best_d_samples = 0;
 
     while (true) {
         if (!solo_cali_active_.load(std::memory_order_acquire)) return false;
         const auto elapsed = juce::Time::getMillisecondCounter() - t_start;
-        if (elapsed > static_cast<std::uint32_t>(kTotalTimeoutMs)) break;
 
-        // Update status string.
+        // Refresh status.
         {
             const juce::ScopedLock sl(solo_cali_message_lock_);
-            solo_cali_message_ = "Slot " + std::to_string(target_slot)
-                                + (ever_heard ? ": measuring... " : ": waiting for audio... ")
-                                + "(" + std::to_string(elapsed / 1000) + "s)";
+            if (!ever_heard) {
+                solo_cali_message_ = "Slot " + std::to_string(target_slot)
+                                    + ": waiting for audio... ("
+                                    + std::to_string(elapsed / 1000) + "s)";
+            } else {
+                solo_cali_message_ = "Slot " + std::to_string(target_slot)
+                                    + ": measuring (best conf "
+                                    + std::to_string(static_cast<int>(best_conf * 100))
+                                    + "%, "
+                                    + std::to_string(measurement_count) + " takes, "
+                                    + std::to_string(elapsed / 1000) + "s)";
+            }
         }
 
         if (!check_audible()) {
@@ -474,9 +489,6 @@ bool HubProcessor::measureOneSatSolo(int target_slot) {
         }
 
         if (!ever_heard) {
-            // First time we detect content. Let the ref ring accumulate
-            // a bit more before correlating so we have a long enough
-            // window for the cross-correlation.
             ever_heard = true;
             juce::Thread::getCurrentThread()->wait(kCaptureExtendMs);
             if (!solo_cali_active_.load(std::memory_order_acquire)) return false;
@@ -485,19 +497,27 @@ bool HubProcessor::measureOneSatSolo(int target_slot) {
         solo_cali_state_.store(static_cast<std::uint8_t>(SoloCaliState::Measuring),
                                 std::memory_order_release);
         pdcCalibratorTick();
-        ++measurement_attempts;
+        ++measurement_count;
 
         const auto conf = pdc_confidence_[static_cast<std::size_t>(target_slot)]
                               .load(std::memory_order_relaxed);
-        if (conf >= kConfidentEnough) return true;
+        const auto d    = pdc_d_samples_[static_cast<std::size_t>(target_slot)]
+                              .load(std::memory_order_relaxed);
+        // Remember the best result so far.
+        if (conf > best_conf) {
+            best_conf      = conf;
+            best_d_samples = d;
+        }
 
-        // Not confident yet — wait a bit more and try again with fresh content.
+        if (conf >= kConfidentEnough) {
+            return true;
+        }
+
+        // Not confident yet — wait a bit and try again.
         solo_cali_state_.store(static_cast<std::uint8_t>(SoloCaliState::Capturing),
                                 std::memory_order_release);
-        juce::Thread::getCurrentThread()->wait(500);
+        juce::Thread::getCurrentThread()->wait(kInterMeasureMs);
     }
-
-    return false;
 }
 
 // Cross-correlate each active sat's recent audio against the hub-input
@@ -512,7 +532,8 @@ void HubProcessor::pdcCalibratorTick() {
 
     constexpr int N = 1024;  // sat window length (~21ms @ 48k) — short enough to
                              // fit inside a short sampler-clip burst (~50ms+)
-    constexpr int K = 2048;  // ± lag search range (~43ms @ 48k) — covers typical PDC
+    constexpr int K = 4096;  // ± lag search range (~85ms @ 48k) — covers Bitwig's
+                             // observed PDC offsets which can run to 40-85 ms
     constexpr double kMinEnergy      = 1e-6;
 
     const auto hub_anchor = pdc_ref_anchor_host_frame_.load(std::memory_order_relaxed);

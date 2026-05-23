@@ -285,9 +285,10 @@ public:
         // almost always wrong (either no real peak, or true D is beyond
         // the search range and we landed at the edge).
         const auto abs_m = m < 0 ? -m : m;
-        // boundary equals the calibrator's K (~4096); we don't expose K
-        // publicly so use a conservative threshold here:
-        constexpr std::int64_t kBoundaryGuard = 4090;
+        // boundary equals the calibrator's K (= 4096 samples). A measurement
+        // landing within 8 samples of the boundary almost certainly means
+        // the true peak is outside the search range — reject it.
+        constexpr std::int64_t kBoundaryGuard = 4088;
         if (abs_m >= kBoundaryGuard) return 0;
         return m;
     }
