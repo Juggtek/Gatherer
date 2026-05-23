@@ -201,14 +201,26 @@ void SatelliteProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mi
         }
     }
 
-    bool injected = false;
+    // PDC spike injection. Hub sets `inject_spike` for all live sats at
+    // once. Each sat waits `slot_index` additional blocks before firing
+    // its spike (so slot 0 fires in the next block, slot 1 the one after,
+    // etc.). This staggering means hub sees each sat's spike in its own
+    // unambiguous block of input, avoiding superposition issues.
     if (region_ != nullptr && frames >= 4 && pb_playing && pb_have_frame) {
         const int idx = slot_index_.load(std::memory_order_acquire);
         if (idx >= 0 && idx < static_cast<int>(gatherer::protocol::NUM_SLOTS)) {
             auto& slot = region_->slots[idx];
-            std::uint32_t want = 1u;
-            if (slot.inject_spike.compare_exchange_strong(want, 0u,
-                                                            std::memory_order_acq_rel)) {
+
+            // Pick up new trigger and start countdown if currently idle.
+            if (cali_block_countdown_ < 0) {
+                std::uint32_t want = 1u;
+                if (slot.inject_spike.compare_exchange_strong(want, 0u,
+                                                                std::memory_order_acq_rel)) {
+                    cali_block_countdown_ = idx;  // fire in (idx + 1)th block from now
+                }
+            }
+
+            if (cali_block_countdown_ == 0) {
                 const float pat[4] = { 1.0f, -1.0f, 1.0f, -1.0f };
                 for (int ch = 0; ch < buffer.getNumChannels(); ++ch) {
                     auto* w = buffer.getWritePointer(ch);
@@ -216,16 +228,13 @@ void SatelliteProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mi
                 }
                 SpscRingBuffer rb_wp(slot.ring_header, slot.ring_data, RING_FRAMES, RING_CHANNELS);
                 slot.spike_wp          .store(rb_wp.writePos(), std::memory_order_release);
-                // Spike lands at the start of this block, so its master
-                // frame is `hfs_at_block_start`. Publishing this directly
-                // avoids the sat_anchor + wp mapping which drifts when sat
-                // fires off-transport callbacks.
                 slot.spike_master_frame.store(hfs_at_block_start, std::memory_order_release);
-                injected = true;
+                cali_block_countdown_ = -1;
+            } else if (cali_block_countdown_ > 0) {
+                --cali_block_countdown_;
             }
         }
     }
-    juce::ignoreUnused(injected);
 
     writeInterleavedToRing(buffer, frames);
     // Pass-through: leave buffer untouched.

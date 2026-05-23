@@ -407,27 +407,52 @@ void HubProcessor::runSpikeCalibration() {
         return;
     }
 
+    // Trigger ALL live sats in one go. Each sat injects its spike in a
+    // different block (slot 0 immediately, slot 1 one block later, etc.)
+    // so hub sees each one in its own unambiguous time window. Single
+    // Calibrate click → every sat sends a signal in parallel, the way
+    // the user described.
+    {
+        const juce::ScopedLock sl(solo_cali_message_lock_);
+        solo_cali_message_ = "Triggering spikes on all live sats...";
+    }
+    int max_slot_idx = 0;
+    for (int slot : active_slots) {
+        auto& sslot = region_->slots[slot];
+        sslot.spike_wp           .store(0, std::memory_order_release);
+        sslot.spike_master_frame .store(0, std::memory_order_release);
+        sslot.inject_spike       .store(1u, std::memory_order_release);
+        if (slot > max_slot_idx) max_slot_idx = slot;
+    }
+
+    // Wait long enough for every sat to fire its delayed spike AND for
+    // hub to capture it. Worst-case: max_slot_idx blocks of staggering +
+    // a few blocks of propagation through the parent bus + safety.
+    // At typical Bitwig block sizes ~5ms, 16 slots * 5 + 100 ≈ 180ms is
+    // plenty.
+    juce::Thread::getCurrentThread()->wait(300);
+    if (!solo_cali_active_.load(std::memory_order_acquire)) {
+        solo_cali_state_.store(static_cast<std::uint8_t>(SoloCaliState::Failed),
+                                std::memory_order_release);
+        return;
+    }
+
     int successes = 0;
     std::string last_fail;
     for (int slot : active_slots) {
-        if (!solo_cali_active_.load(std::memory_order_acquire)) break;  // cancelled
-
         solo_cali_current_.store(slot, std::memory_order_release);
-        solo_cali_state_  .store(static_cast<std::uint8_t>(SoloCaliState::Capturing),
-                                  std::memory_order_release);
         {
             const juce::ScopedLock sl(solo_cali_message_lock_);
-            solo_cali_message_ = "Calibrating slot " + std::to_string(slot) + "...";
+            solo_cali_message_ = "Locating slot " + std::to_string(slot) + " spike...";
         }
-
         const bool ok = measureOneSatSpike(slot);
         solo_cali_completed_.fetch_add(1, std::memory_order_release);
         if (ok) {
             ++successes;
         } else {
             last_fail = "Slot " + std::to_string(slot)
-                       + ": spike not detected — check that this track is "
-                         "currently producing audio (not clip-gated silent).";
+                       + ": spike not detected — track may be clip-gated "
+                         "(no audio at the current playhead).";
         }
     }
 
@@ -454,30 +479,17 @@ bool HubProcessor::measureOneSatSpike(int target_slot) {
     if (region_ == nullptr) return false;
     auto& slot = region_->slots[target_slot];
 
-    // Hub's ref ring must have been receiving audio recently — that's how
-    // we'll search for the spike's arrival. If we're not playing, bail.
     if (pdc_ref_data_.empty()) return false;
     if (!pdc_ref_anchor_set_.load(std::memory_order_acquire)) return false;
 
-    // Trigger spike injection. Sat will fire on its next processBlock
-    // (only when transport is playing), inject the pattern (+1, -1, +1,
-    // -1) into both its output buffer and SHM ring, and publish the
-    // master frame at which the spike landed via spike_master_frame.
-    slot.spike_wp           .store(0, std::memory_order_release);
-    slot.spike_master_frame .store(0, std::memory_order_release);
-    slot.inject_spike       .store(1u, std::memory_order_release);
-
-    // Wait long enough for: sat to fire its next callback, hub to
-    // capture that callback (and several subsequent ones, so the spike
-    // has time to propagate through any track-output PDC delay).
-    juce::Thread::getCurrentThread()->wait(250);
-    if (!solo_cali_active_.load(std::memory_order_acquire)) return false;
-
+    // Flags were already set by runSpikeCalibration; just read what sat
+    // published (if anything).
     const auto sat_spike_wp      = slot.spike_wp.load(std::memory_order_acquire);
     const auto sat_spike_master  = slot.spike_master_frame.load(std::memory_order_acquire);
     if (sat_spike_wp == 0 || sat_spike_master == 0) {
-        // Sat never fired with a valid playhead (silent track? transport
-        // stopped right after we set the flag?). Clear and fail.
+        // Sat never fired (clip-gated, transport stopped right after
+        // we set the flag, or sat plugin didn't actually receive
+        // processBlock during the wait window).
         slot.inject_spike.store(0u, std::memory_order_release);
         return false;
     }
