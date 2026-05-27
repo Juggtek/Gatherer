@@ -5,7 +5,7 @@
 //! The 30 Hz tick pulls peak meters from the audio thread. Built-in iced
 //! widgets for now; FIELD's canvas meters/faders are a later polish pass.
 
-use crate::adaptive::AdaptiveMixer;
+use crate::adaptive::{AdaptiveMixer, Mode, Mood, SlotField, SLOT_COUNT};
 use crate::audio::{self, AudioEngine};
 use crate::measurement::{self, LufsMeasurement};
 use crate::midi::{self, MidiSync, PPQN};
@@ -15,7 +15,7 @@ use crate::recording::{RecordState, RecorderControl};
 use cpal::traits::{DeviceTrait, HostTrait};
 use iced::widget::{
     button, canvas, checkbox, column, container, progress_bar, row, scrollable, slider, text,
-    text_input, Space,
+    text_input, vertical_slider, Space,
 };
 use iced::{
     alignment, mouse, Alignment, Color, Element, Length, Pixels, Point, Rectangle, Renderer, Size,
@@ -30,9 +30,13 @@ use std::time::{Duration, Instant};
 
 /// Timeline geometry constants.
 const PIXELS_PER_UNIT: f32 = 100.0; // 1 bar (or 1 s without MIDI sync) = this many px
-const LANE_HEIGHT: f32 = 56.0;
+const LANE_HEIGHT: f32 = 48.0;
 const RULER_HEIGHT: f32 = 22.0;
+#[allow(dead_code)] // superseded by SOURCES_COL_WIDTH
 const TIMELINE_LABEL_WIDTH: f32 = 64.0;
+/// Width of the sources column on the left of the timeline. Fits the
+/// per-source row (name/meter/R-M-S-Ø/slider/dB/LUFS/Δ).
+const SOURCES_COL_WIDTH: f32 = 700.0;
 const MIN_UNITS_VISIBLE: f32 = 16.0;
 const TIMELINE_PADDING_UNITS: f32 = 2.0;
 /// At any zoom, ensure the timeline content fills at least this much
@@ -74,6 +78,23 @@ pub enum Message {
     SaveSession,
     LoadSession(String),
     ToggleAdaptive(bool),
+    SetIntensity(f32),
+    SetMood(Mood),
+    SetMode(Mode),
+    SetSmoothMs(f32),
+    ToggleTargetCurve(bool),
+    ToggleTargetCurvePopover,
+    SetSlotField(usize, SlotField, f32),
+    SetSlotFormula(usize, i32),
+    SetTargetCurveField(Mode, SlotField, f32),
+    SetTargetCurveFormula(Mode, i32),
+    SetMoodWeight(Mood, usize, f32),
+    SetBalancerMask(Mood, usize, f32),
+    ApplySourcePreset(usize, String),
+    ResetTargetCurveToPreset(Mode),
+    ImportTemplate,
+    ExportTemplate,
+    OpenSessionFolder,
     Tick,
 }
 
@@ -139,6 +160,10 @@ pub struct State {
     /// Adaptive mixer — programmatically writes per-source slider values
     /// based on the (TBD) supplied logic. Off by default.
     adaptive: AdaptiveMixer,
+    /// Target-curve detail popover (in the control strip) — when open,
+    /// expands a panel above the control strip that shows + edits the
+    /// current mode's target curve.
+    target_curve_popover_open: bool,
 }
 
 impl State {
@@ -183,6 +208,7 @@ impl State {
             layer_names: Vec::new(),
             session_status: None,
             adaptive: AdaptiveMixer::new(),
+            target_curve_popover_open: false,
         };
         state.restart_engine();
         state
@@ -362,6 +388,150 @@ impl State {
             Message::SaveSession => self.do_save_session(),
             Message::LoadSession(name) => self.do_load_session(name),
             Message::ToggleAdaptive(on) => self.adaptive.set_enabled(on),
+            Message::SetIntensity(v) => {
+                self.adaptive.intensity = v.clamp(0.0, 1.0);
+            }
+            Message::SetMood(m) => self.adaptive.mood = m,
+            Message::SetMode(m) => self.adaptive.mode = m,
+            Message::SetSmoothMs(v) => {
+                self.adaptive.smooth_ms = v.clamp(1.0, 5000.0);
+            }
+            Message::ToggleTargetCurve(on) => {
+                self.adaptive.activate_target_curve = on;
+            }
+            Message::ToggleTargetCurvePopover => {
+                self.target_curve_popover_open = !self.target_curve_popover_open;
+            }
+            Message::SetSlotField(slot, field, value) => {
+                if let Some(p) = self.adaptive.slot_params.get_mut(slot) {
+                    p.set_field(field, value);
+                }
+            }
+            Message::SetSlotFormula(slot, delta) => {
+                if let Some(p) = self.adaptive.slot_params.get_mut(slot) {
+                    let next = (p.formula as i32 + delta).clamp(1, 9);
+                    p.formula = next as u8;
+                }
+            }
+            Message::SetTargetCurveField(mode, field, value) => {
+                let idx = mode as usize;
+                if let Some(p) = self.adaptive.target_curve.get_mut(idx) {
+                    p.set_field(field, value);
+                }
+            }
+            Message::SetTargetCurveFormula(mode, delta) => {
+                let idx = mode as usize;
+                if let Some(p) = self.adaptive.target_curve.get_mut(idx) {
+                    let next = (p.formula as i32 + delta).clamp(1, 9);
+                    p.formula = next as u8;
+                }
+            }
+            Message::SetMoodWeight(mood, slot, value) => {
+                if let Some(row) = self.adaptive.mood_weight.get_mut(mood as usize) {
+                    if let Some(cell) = row.get_mut(slot) {
+                        *cell = value.clamp(0.0, 1.0);
+                    }
+                }
+            }
+            Message::SetBalancerMask(mood, slot, value) => {
+                if let Some(row) = self.adaptive.balancer_mask.get_mut(mood as usize) {
+                    if let Some(cell) = row.get_mut(slot) {
+                        *cell = value.clamp(0.0, 1.0);
+                    }
+                }
+            }
+            Message::ApplySourcePreset(slot, label) => {
+                if let Some(&(_, preset)) = crate::adaptive::SOURCE_PRESETS
+                    .iter()
+                    .find(|(name, _)| *name == label)
+                {
+                    if let Some(p) = self.adaptive.slot_params.get_mut(slot) {
+                        *p = preset;
+                    }
+                }
+            }
+            Message::ResetTargetCurveToPreset(mode) => {
+                let idx = mode as usize;
+                if let (Some(slot), Some(preset)) = (
+                    self.adaptive.target_curve.get_mut(idx),
+                    crate::adaptive::TARGET_PRESETS.get(idx),
+                ) {
+                    *slot = *preset;
+                }
+            }
+            Message::ImportTemplate => {
+                // Native file picker; remembers the last directory across
+                // launches via `~/Music/Gatherer/.last_template_dir`.
+                let mut dlg = rfd::FileDialog::new()
+                    .set_title("Import adaptive-mixer template")
+                    .add_filter("Template (.txt)", &["txt"]);
+                if let Some(dir) = crate::template::read_last_dir() {
+                    dlg = dlg.set_directory(dir);
+                } else if let Some(dir) = crate::template::templates_dir() {
+                    dlg = dlg.set_directory(dir);
+                }
+                if let Some(path) = dlg.pick_file() {
+                    if let Some(parent) = path.parent() {
+                        crate::template::write_last_dir(parent);
+                    }
+                    match crate::template::parse_file_into(&path, &mut self.adaptive) {
+                        Ok(()) => {
+                            self.session_status =
+                                Some(format!("imported template \u{2192} {}", path.display()));
+                        }
+                        Err(e) => {
+                            self.session_status = Some(format!("import error: {e}"));
+                        }
+                    }
+                }
+            }
+            Message::ExportTemplate => {
+                // Write into the session folder so the template lives next
+                // to the recording/take/session.toml it was authored against.
+                let name = if self.session_name.trim().is_empty() {
+                    "untitled".to_string()
+                } else {
+                    self.session_name.trim().to_string()
+                };
+                match crate::session::ensure_root(&name) {
+                    Ok(root) => {
+                        let path = root.join(format!("{name}.txt"));
+                        match crate::template::save_to(&path, &self.adaptive) {
+                            Ok(p) => {
+                                self.session_status =
+                                    Some(format!("exported template \u{2192} {}", p.display()));
+                            }
+                            Err(e) => {
+                                self.session_status =
+                                    Some(format!("export template error: {e}"));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.session_status = Some(format!("session folder error: {e}"));
+                    }
+                }
+            }
+            Message::OpenSessionFolder => {
+                let name = if self.session_name.trim().is_empty() {
+                    "untitled".to_string()
+                } else {
+                    self.session_name.trim().to_string()
+                };
+                match crate::session::ensure_root(&name) {
+                    Ok(root) => {
+                        // macOS `open`; ignore status (Finder may have its
+                        // own complaints we can't act on). On other OSes
+                        // we'd swap in `xdg-open` / `explorer`.
+                        let _ = std::process::Command::new("open").arg(&root).spawn();
+                        self.session_status =
+                            Some(format!("opened \u{2192} {}", root.display()));
+                    }
+                    Err(e) => {
+                        self.session_status = Some(format!("session folder error: {e}"));
+                    }
+                }
+            }
             Message::Tick => {
                 self.refresh_meters();
                 if let Some(t) = self.pending_load_at {
@@ -370,9 +540,8 @@ impl State {
                         self.load_take();
                     }
                 }
-                // Run the adaptive mixer step (no-op until the logic lands).
-                let playing = self.playback.is_playing();
-                self.adaptive.step(&self.params, playing);
+                // Run the adaptive mixer step (no-op when disabled).
+                self.adaptive.step(&self.params);
             }
         }
         Task::none()
@@ -630,198 +799,7 @@ impl State {
     }
 
     pub fn view(&self) -> Element<'_, Message> {
-        let input_picker = pick_row(
-            "Capture",
-            &self.input_devices,
-            &self.selected_input,
-            Message::InputDeviceSelected,
-        );
-        let output_picker = pick_row(
-            "Monitor",
-            &self.output_devices,
-            &self.selected_output,
-            Message::OutputDeviceSelected,
-        );
-
-        let mut body = column![column![
-            text("Gatherer Hub").size(28),
-            text("Each stereo input pair is one gathered source. The DAW's PDC \
-                  delivers them already aligned.")
-                .size(12),
-        ]
-        .spacing(2)]
-        .spacing(10);
-
-        // ---- LEFT column: pickers + MIDI + MASTER + Meter + Zoom + Snap. ----
-        let master_block = row![
-            text("MASTER").size(14).width(Length::Fixed(70.0)),
-            meter_bar(self.master_peak_db, 220.0),
-            slider(GAIN_DB_MIN..=GAIN_DB_MAX, self.master_gain_db, Message::SetMasterGainDb)
-                .step(0.5)
-                .width(Length::Fixed(160.0)),
-            text(format!("{:+.1} dB", self.master_gain_db)).width(Length::Fixed(70.0)),
-        ]
-        .spacing(10)
-        .align_y(Alignment::Center);
-
-        let meter_block = row![
-            text("Meter").width(Length::Fixed(50.0)),
-            button(text("\u{2212}")).on_press(Message::TimeSigNumChanged(-1)),
-            text(format!("{}/4", self.time_sig_num))
-                .width(Length::Fixed(40.0))
-                .align_x(alignment::Horizontal::Center),
-            button(text("+")).on_press(Message::TimeSigNumChanged(1)),
-            text("(match your DAW)").size(11),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center);
-
-        let zoom_block = row![
-            text("Zoom").width(Length::Fixed(50.0)),
-            button(text("\u{2212}")).on_press(Message::ZoomOut),
-            text(format!("{:>4.0}%", self.zoom * 100.0))
-                .width(Length::Fixed(56.0))
-                .align_x(alignment::Horizontal::Center),
-            button(text("+")).on_press(Message::ZoomIn),
-            button(text("100%")).on_press(Message::ZoomReset),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center);
-
-        let snap_block = row![
-            text("Snap").width(Length::Fixed(50.0)),
-            checkbox("Snap to bars on release", self.snap_to_grid)
-                .on_toggle(Message::ToggleSnap),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center);
-
-        let adaptive_block = row![
-            text("Mixer").width(Length::Fixed(50.0)),
-            checkbox("Adaptive (auto-moves the per-source sliders)", self.adaptive.is_enabled())
-                .on_toggle(Message::ToggleAdaptive),
-            text(if self.adaptive.is_enabled() {
-                format!("active \u{2014} t = {:.1} s", self.adaptive.elapsed_seconds())
-            } else {
-                "off (manual sliders)".to_string()
-            })
-            .size(11),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center);
-
-        // ---- LEFT (extension): Normalize & Export + per-source LUFS detail. ----
-        let target_row = row![
-            text("Target").width(Length::Fixed(60.0)),
-            slider(-30.0..=0.0, self.target_lufs, Message::SetTargetLufs)
-                .step(0.5)
-                .width(Length::Fixed(220.0)),
-            text(format!("{:.1} LUFS", self.target_lufs)).width(Length::Fixed(90.0)),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center);
-
-        let export_status: String = if let Some(p) = &self.last_export_dir {
-            format!("\u{2192} {}", p.display())
-        } else if let Some(e) = &self.export_error {
-            format!("error: {e}")
-        } else {
-            "writes original/ + normalized/ under ~/Music/Gatherer Exports/".into()
-        };
-
-        let export_row = row![
-            button(text("Export stems")).on_press(Message::ExportStems),
-            text(export_status).size(11),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center);
-
-        let export_block = column![
-            text("Normalize & Export").size(14),
-            target_row,
-            export_row,
-        ]
-        .spacing(4);
-
-        let mut measurements_block = column![].spacing(2);
-        if !self.lufs_results.is_empty() {
-            measurements_block = measurements_block
-                .push(text("Measurements (max over take) + normalization Δ").size(12));
-            for src in 0..self.num_sources {
-                if let Some(m) = self.lufs_results.get(&src) {
-                    let label = self
-                        .layer_names
-                        .get(src)
-                        .map(|s| s.trim())
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| format!("Src {}", src + 1));
-                    let line = if m.integrated.is_finite() {
-                        let delta = self.target_lufs as f64 - m.integrated;
-                        format!(
-                            "{}:  I {:>6.1}   S {:>6.1}   M {:>6.1}   \u{0394} {:>+5.1} dB",
-                            label,
-                            m.integrated,
-                            m.max_short_term,
-                            m.max_momentary,
-                            delta
-                        )
-                    } else {
-                        format!("{}:  \u{2014}", label)
-                    };
-                    measurements_block = measurements_block.push(text(line).size(11));
-                }
-            }
-        }
-
-        let session_row = row![
-            text("Session").width(Length::Fixed(60.0)),
-            text_input("session-<auto>", &self.session_name)
-                .on_input(Message::SetSessionName)
-                .width(Length::Fixed(240.0)),
-            button(text("Save")).on_press(Message::SaveSession),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center);
-
-        let sessions = crate::session::list_sessions();
-        let load_row = row![
-            Space::with_width(Length::Fixed(60.0)),
-            iced::widget::pick_list(
-                sessions,
-                Option::<String>::None,
-                Message::LoadSession,
-            )
-            .placeholder("Open existing session\u{2026}")
-            .width(Length::Fixed(240.0)),
-            text(self.session_status.as_deref().unwrap_or("")).size(11),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center);
-
-        let mut left_col = column![]
-            .spacing(8)
-            .push(input_picker)
-            .push(output_picker)
-            .push(session_row)
-            .push(load_row)
-            .push(text(midi_status_line(self.midi.as_ref(), self.time_sig_num)).size(13));
-        if let Some(err) = &self.error {
-            left_col = left_col.push(text(format!("audio error: {err}")).size(13));
-        }
-        let left_col = left_col
-            .push(Space::with_height(4))
-            .push(master_block)
-            .push(meter_block)
-            .push(zoom_block)
-            .push(snap_block)
-            .push(adaptive_block)
-            .push(Space::with_height(6))
-            .push(export_block)
-            .push(measurements_block)
-            .width(Length::Fixed(580.0));
-
-        // ---- RIGHT column: Sources + Record/Transport. ----
+        // ─── shared state ──────────────────────────────────────────────
         let (recording, rec_status) = match &self.recorder {
             Some(r) if r.recording => (
                 true,
@@ -839,54 +817,540 @@ impl State {
             ),
             None => (false, "no engine".to_string()),
         };
-
         let sr = self.engine.as_ref().map(|e| e.sample_rate).unwrap_or(48_000.0);
         let pos_s = self.playback.position() as f32 / sr;
         let len_s = self.playback.len_frames() as f32 / sr;
+        let export_status: String = if let Some(p) = &self.last_export_dir {
+            format!("\u{2192} {}", p.display())
+        } else if let Some(e) = &self.export_error {
+            format!("export error: {e}")
+        } else {
+            String::new()
+        };
+        let sessions = crate::session::list_sessions();
 
-        let transport_block = row![
-            button(text(if recording { "Stop" } else { "Record" }))
-                .on_press(Message::ToggleRecord),
-            text(rec_status).size(13),
-            Space::with_width(Length::Fixed(16.0)),
-            button(text("\u{25B6} Play")).on_press(Message::PlaybackPlay),
-            button(text("Pause")).on_press(Message::PlaybackPause),
-            button(text("Stop")).on_press(Message::PlaybackStop),
-            text(format!("{pos_s:.1}s / {len_s:.1}s")).size(13),
+        // ─── TOP STRIP: Title | Capture | Monitor | Session | MIDI | Master ───
+        let top_strip = row![
+            text("Gatherer Hub").size(20),
+            iced::widget::pick_list(
+                self.input_devices.clone(),
+                self.selected_input.clone(),
+                Message::InputDeviceSelected,
+            )
+            .placeholder("Capture\u{2026}")
+            .width(Length::Fixed(200.0)),
+            iced::widget::pick_list(
+                self.output_devices.clone(),
+                self.selected_output.clone(),
+                Message::OutputDeviceSelected,
+            )
+            .placeholder("Monitor\u{2026}")
+            .width(Length::Fixed(200.0)),
+            text_input("session\u{2026}", &self.session_name)
+                .on_input(Message::SetSessionName)
+                .width(Length::Fixed(160.0)),
+            button(text("Save")).on_press(Message::SaveSession),
+            iced::widget::pick_list(sessions, Option::<String>::None, Message::LoadSession)
+                .placeholder("Load\u{2026}")
+                .width(Length::Fixed(140.0)),
+            text(midi_status_line(self.midi.as_ref(), self.time_sig_num)).size(11),
+            Space::with_width(Length::Fill),
+            text("MASTER").size(12),
+            meter_bar(self.master_peak_db, 140.0),
+            slider(GAIN_DB_MIN..=GAIN_DB_MAX, self.master_gain_db, Message::SetMasterGainDb)
+                .step(0.5)
+                .width(Length::Fixed(120.0)),
+            text(format!("{:+.1} dB", self.master_gain_db))
+                .size(11)
+                .width(Length::Fixed(50.0)),
         ]
         .spacing(8)
         .align_y(Alignment::Center);
 
-        let mut right_col = column![].spacing(4).push(text("Sources").size(14));
-        for i in 0..self.num_sources {
-            right_col = right_col.push(self.source_row(i));
+        // Status sub-line (errors + session_status) under the top strip.
+        let mut top_status: iced::widget::Column<'_, Message> = column![].spacing(2);
+        if let Some(err) = &self.error {
+            top_status = top_status.push(text(format!("audio error: {err}")).size(11));
         }
-        right_col = right_col.push(Space::with_height(6));
-        right_col = right_col.push(transport_block);
-        let right_col = right_col.width(Length::Fill);
-
-        body = body.push(row![left_col, right_col].spacing(20));
-
-        // Bar-based timeline (scrollable horizontally; takes positioned at
-        // their actual bar offset on the DAW's grid; click to seek).
-        if self.num_sources > 0 {
-            body = body.push(Space::with_height(10));
-            body = body.push(text("Timeline").size(14));
-            body = body.push(self.timeline_section());
+        if let Some(s) = &self.session_status {
+            if !s.is_empty() {
+                top_status = top_status.push(text(s.clone()).size(11));
+            }
         }
 
-        container(body).padding(16).width(Length::Fill).height(Length::Fill).into()
+        // ─── ACTION STRIP: Record | Transport | Meter | Zoom | Snap | Target+Export ───
+        let action_strip = row![
+            button(text(if recording { "Stop Rec" } else { "Record" }))
+                .on_press(Message::ToggleRecord),
+            text(rec_status).size(11),
+            Space::with_width(Length::Fixed(10.0)),
+            button(text("\u{25B6} Play")).on_press(Message::PlaybackPlay),
+            button(text("Pause")).on_press(Message::PlaybackPause),
+            button(text("Stop")).on_press(Message::PlaybackStop),
+            text(format!("{pos_s:>5.1}s / {len_s:>5.1}s")).size(11),
+            Space::with_width(Length::Fixed(14.0)),
+            text("Meter").size(11),
+            button(text("\u{2212}")).on_press(Message::TimeSigNumChanged(-1)),
+            text(format!("{}/4", self.time_sig_num))
+                .size(11)
+                .width(Length::Fixed(32.0))
+                .align_x(alignment::Horizontal::Center),
+            button(text("+")).on_press(Message::TimeSigNumChanged(1)),
+            Space::with_width(Length::Fixed(14.0)),
+            text("Zoom").size(11),
+            button(text("\u{2212}")).on_press(Message::ZoomOut),
+            text(format!("{:>3.0}%", self.zoom * 100.0))
+                .size(11)
+                .width(Length::Fixed(48.0))
+                .align_x(alignment::Horizontal::Center),
+            button(text("+")).on_press(Message::ZoomIn),
+            button(text("100%")).on_press(Message::ZoomReset),
+            Space::with_width(Length::Fixed(8.0)),
+            checkbox("Snap", self.snap_to_grid).on_toggle(Message::ToggleSnap),
+            Space::with_width(Length::Fill),
+            // Template I/O — Max-patch 97-float .txt format. Import opens
+            // a native file dialog (last dir remembered between launches
+            // in `~/Music/Gatherer/.last_template_dir`); Export writes
+            // `<session>/<session>.txt` next to the recording.
+            button(text("Import tpl")).on_press(Message::ImportTemplate),
+            button(text("Export tpl")).on_press(Message::ExportTemplate),
+            Space::with_width(Length::Fixed(8.0)),
+            text("Target").size(11),
+            slider(-30.0..=0.0, self.target_lufs, Message::SetTargetLufs)
+                .step(0.5)
+                .width(Length::Fixed(140.0)),
+            text(format!("{:>5.1} LUFS", self.target_lufs))
+                .size(11)
+                .width(Length::Fixed(70.0)),
+            button(text("Export stems")).on_press(Message::ExportStems),
+            button(text("Open folder")).on_press(Message::OpenSessionFolder),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+
+        let mut action_status: iced::widget::Column<'_, Message> = column![].spacing(2);
+        if !export_status.is_empty() {
+            action_status = action_status.push(text(export_status).size(10));
+        }
+
+        // ─── MIXER VIEW (between top strip and playback strip): 8 columns ───
+        let mixer_view = self.mixer_view();
+
+        // ─── MAIN BODY: sources column on the LEFT, scrollable timeline on the RIGHT ───
+        // Wrapped in a Fill-height container so the control strip pins to the bottom.
+        let main_body = container(self.main_body_row())
+            .width(Length::Fill)
+            .height(Length::Fill);
+
+        // ─── CONTROL STRIP (bottom, attached): Adaptive · Intensity · Mood · Mode · Smooth · Target Curve ───
+        let control_strip = row![
+            checkbox("Adaptive", self.adaptive.is_enabled())
+                .on_toggle(Message::ToggleAdaptive),
+            Space::with_width(Length::Fixed(10.0)),
+            text("Intensity").size(11),
+            slider(0.0..=1.0, self.adaptive.intensity, Message::SetIntensity)
+                .step(0.001)
+                .width(Length::Fixed(220.0)),
+            text(format!("{:>5.3}", self.adaptive.intensity))
+                .size(11)
+                .width(Length::Fixed(48.0)),
+            Space::with_width(Length::Fixed(10.0)),
+            text("Mood").size(11),
+            iced::widget::radio("Dark", Mood::Dark, Some(self.adaptive.mood), Message::SetMood),
+            iced::widget::radio("Neutral", Mood::Neutral, Some(self.adaptive.mood), Message::SetMood),
+            iced::widget::radio("Bright", Mood::Bright, Some(self.adaptive.mood), Message::SetMood),
+            Space::with_width(Length::Fixed(10.0)),
+            text("Mode").size(11),
+            iced::widget::radio("Music", Mode::Music, Some(self.adaptive.mode), Message::SetMode),
+            iced::widget::radio("Locals", Mode::Locals, Some(self.adaptive.mode), Message::SetMode),
+            iced::widget::radio("Globals", Mode::Globals, Some(self.adaptive.mode), Message::SetMode),
+            iced::widget::radio("Combat", Mode::Combat, Some(self.adaptive.mode), Message::SetMode),
+            Space::with_width(Length::Fixed(10.0)),
+            text("Smooth").size(11),
+            slider(1.0..=2000.0, self.adaptive.smooth_ms, Message::SetSmoothMs)
+                .step(1.0)
+                .width(Length::Fixed(140.0)),
+            text(format!("{:>4.0}ms", self.adaptive.smooth_ms))
+                .size(11)
+                .width(Length::Fixed(58.0)),
+            Space::with_width(Length::Fixed(10.0)),
+            checkbox("Target Curve", self.adaptive.activate_target_curve)
+                .on_toggle(Message::ToggleTargetCurve),
+            button(text(if self.target_curve_popover_open { "\u{25BC}" } else { "\u{2026}" }))
+                .on_press(Message::ToggleTargetCurvePopover),
+            Space::with_width(Length::Fill),
+            text(format!(
+                "POWER {:>5.3}  FACTOR {:>5.3}  TARGET {:>5.3}",
+                self.adaptive.last_power_sum,
+                self.adaptive.last_factor,
+                self.adaptive.last_target
+            ))
+            .size(10),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+
+        // Masks strip (M1 mood + M2 balancer matrices, mirrored from
+        // `Adaptive-Mixer_1.0.0_mac.maxpat`'s "MOOD" panel) sits between
+        // the timeline body and the control strip.
+        let masks_strip = self.masks_strip();
+
+        // Body is the full layout — main_body has Length::Fill so the
+        // control strip pins to the bottom of the window.
+        let body: Element<'_, Message> = column![
+            top_strip,
+            top_status,
+            mixer_view,
+            action_strip,
+            action_status,
+            main_body,
+            masks_strip,
+            control_strip,
+        ]
+        .spacing(8)
+        .into();
+
+        // The target-curve popover is a TRUE overlay (iced Stack): it
+        // floats above the timeline without taking any layout space.
+        // Positioned bottom-left with padding so it sits just above the
+        // control strip and doesn't cover the mixer view.
+        let content: Element<'_, Message> = if self.target_curve_popover_open {
+            let overlay = container(self.target_curve_popover_view())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(alignment::Horizontal::Right)
+                .align_y(alignment::Vertical::Bottom)
+                .padding(iced::Padding {
+                    top: 0.0,
+                    right: 16.0,
+                    bottom: 56.0,
+                    left: 0.0,
+                });
+            iced::widget::stack![body, overlay].into()
+        } else {
+            body
+        };
+
+        container(content)
+            .padding(8)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
-    fn timeline_section(&self) -> Element<'_, Message> {
+    /// Mixer view — 8 columns, one per source. Each column has the curve
+    /// visualizer (raw + compensated) ABOVE the 5 SlotParams sliders +
+    /// Formula stepper. Curve is square, axes are intensity 0..1 / gain 0..1.
+    fn mixer_view(&self) -> Element<'_, Message> {
+        const COL_W: f32 = 184.0;
+        const CURVE_SIDE: f32 = 168.0; // square
+        const PARAM_LABEL_W: f32 = 36.0;
+        const PARAM_SLIDER_W: f32 = 100.0;
+        const PARAM_VALUE_W: f32 = 32.0;
+
+        let intensity = self.adaptive.intensity;
+        let n_slots = self.adaptive.slot_params.len();
+        let mut row_el = row![].spacing(6).align_y(Alignment::Start);
+        for s in 0..n_slots {
+            let p = self.adaptive.slot_params[s];
+            let label = self
+                .layer_names
+                .get(s)
+                .map(|n| n.trim())
+                .filter(|n| !n.is_empty())
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| format!("Src {}", s + 1));
+
+            let mk_param = |label: &'static str, value: f32, field: SlotField| -> Element<'_, Message> {
+                row![
+                    text(label).size(10).width(Length::Fixed(PARAM_LABEL_W)),
+                    slider(0.0..=1.0, value, move |v| Message::SetSlotField(s, field, v))
+                        .step(0.001)
+                        .width(Length::Fixed(PARAM_SLIDER_W)),
+                    text(format!("{value:.2}"))
+                        .size(10)
+                        .width(Length::Fixed(PARAM_VALUE_W)),
+                ]
+                .spacing(4)
+                .align_y(Alignment::Center)
+                .into()
+            };
+
+            let formula_row = row![
+                text("F").size(10).width(Length::Fixed(PARAM_LABEL_W)),
+                button(text("\u{2212}").size(10)).on_press(Message::SetSlotFormula(s, -1)),
+                text(format!("{}", p.formula))
+                    .size(10)
+                    .width(Length::Fixed(PARAM_VALUE_W))
+                    .align_x(alignment::Horizontal::Center),
+                button(text("+").size(10)).on_press(Message::SetSlotFormula(s, 1)),
+            ]
+            .spacing(4)
+            .align_y(Alignment::Center);
+
+            let (raw_pts, comp_pts) = self.adaptive.slot_curves(s, 64);
+            let curve = curve_view(raw_pts, comp_pts, intensity, CURVE_SIDE, CURVE_SIDE);
+
+            // Per-source preset picker — verbatim from the Max patch's
+            // `LAYERS` row of default messages. Picking applies all six
+            // SlotParams in one shot (cleaner than nudging each slider).
+            let preset_names: Vec<String> = crate::adaptive::SOURCE_PRESETS
+                .iter()
+                .map(|(n, _)| (*n).to_string())
+                .collect();
+            let preset_picker = iced::widget::pick_list(
+                preset_names,
+                Option::<String>::None,
+                move |name| Message::ApplySourcePreset(s, name),
+            )
+            .placeholder("Preset\u{2026}")
+            .text_size(10)
+            .width(Length::Fixed(COL_W - 4.0));
+
+            // Curve ABOVE the sliders, then 5 params + formula stepper.
+            let col = column![
+                text(label).size(11),
+                curve,
+                preset_picker,
+                Space::with_height(Length::Fixed(2.0)),
+                mk_param("Steep", p.steepness, SlotField::Steepness),
+                mk_param("Dev", p.deviation, SlotField::Deviation),
+                mk_param("Max", p.maximum, SlotField::Maximum),
+                mk_param("Min", p.minimum, SlotField::Minimum),
+                mk_param("Orig", p.original_level, SlotField::Original),
+                formula_row,
+            ]
+            .spacing(2)
+            .width(Length::Fixed(COL_W));
+
+            row_el = row_el.push(col);
+        }
+        row_el.into()
+    }
+
+    /// Target-curve popover — shown when the user clicks the `…` button
+    /// next to the Target Curve toggle. Edits the current mode's 6-param
+    /// target curve and shows its shape over intensity.
+    fn target_curve_popover_view(&self) -> Element<'_, Message> {
+        let mode = self.adaptive.mode;
+        let p = self.adaptive.target_curve[mode as usize];
+        let intensity = self.adaptive.intensity;
+        let pts = self.adaptive.target_curve_points(96);
+
+        let mk_param = |label: &'static str, value: f32, field: SlotField| -> Element<'_, Message> {
+            row![
+                text(label).size(11).width(Length::Fixed(60.0)),
+                slider(0.0..=1.0, value, move |v| Message::SetTargetCurveField(mode, field, v))
+                    .step(0.001)
+                    .width(Length::Fixed(180.0)),
+                text(format!("{value:.3}"))
+                    .size(11)
+                    .width(Length::Fixed(48.0)),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center)
+            .into()
+        };
+
+        let formula_row = row![
+            text("Formula").size(11).width(Length::Fixed(60.0)),
+            button(text("\u{2212}")).on_press(Message::SetTargetCurveFormula(mode, -1)),
+            text(format!("{} / 9", p.formula))
+                .size(11)
+                .width(Length::Fixed(48.0))
+                .align_x(alignment::Horizontal::Center),
+            button(text("+")).on_press(Message::SetTargetCurveFormula(mode, 1)),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+
+        // Square canvas, axes intensity 0..1 / gain 0..1.
+        let curve = curve_view(pts, Vec::new(), intensity, 280.0, 280.0);
+
+        container(
+            row![
+                column![
+                    row![
+                        text(format!("Target curve — {}", mode.label())).size(13),
+                        Space::with_width(Length::Fill),
+                        button(text("Reset to Max preset").size(10))
+                            .on_press(Message::ResetTargetCurveToPreset(mode)),
+                    ]
+                    .align_y(Alignment::Center),
+                    Space::with_height(Length::Fixed(4.0)),
+                    mk_param("Steep", p.steepness, SlotField::Steepness),
+                    mk_param("Dev", p.deviation, SlotField::Deviation),
+                    mk_param("Max", p.maximum, SlotField::Maximum),
+                    mk_param("Min", p.minimum, SlotField::Minimum),
+                    mk_param("Orig", p.original_level, SlotField::Original),
+                    formula_row,
+                ]
+                .spacing(3),
+                Space::with_width(Length::Fixed(12.0)),
+                curve,
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        )
+        .padding(10)
+        .style(|_t| container::Style {
+            background: Some(iced::Background::Color(Color::from_rgb(0.13, 0.14, 0.16))),
+            border: iced::Border {
+                color: Color::from_rgb(0.30, 0.30, 0.34),
+                width: 1.0,
+                radius: 4.0.into(),
+            },
+            ..Default::default()
+        })
+        .into()
+    }
+
+    /// Masks strip — mirrors `Adaptive-Mixer_1.0.0_mac.maxpat`'s "MOOD"
+    /// panel, **grouped by mood**: Dark | Neutral | Bright side by side.
+    /// Each mood group is two stacked rows — M1 mood mask on top, M2
+    /// balancer mask underneath — so a single mood's settings live
+    /// together. A per-source total-volume column on the far right
+    /// reads the live `params.sources[i].gain` (post-slew, what the
+    /// audio thread sees this tick).
+    fn masks_strip(&self) -> Element<'_, Message> {
+        const SLIDER_H: f32 = 48.0;
+        const SLIDER_W: f32 = 14.0;
+        const CELL_W: f32 = 24.0;
+        const ROW_LABEL_W: f32 = 56.0; // "Mood" / "Balancer" left label
+        const ROW_GAP: f32 = 3.0;
+
+        // Column headers (L0..L7), preceded by an empty corner the width
+        // of the row label so the slider columns line up vertically.
+        let header_row = || -> Element<'_, Message> {
+            let mut r = row![Space::with_width(Length::Fixed(ROW_LABEL_W))]
+                .spacing(ROW_GAP)
+                .align_y(Alignment::Center);
+            for s in 0..SLOT_COUNT {
+                r = r.push(
+                    container(text(format!("L{s}")).size(9))
+                        .width(Length::Fixed(CELL_W))
+                        .align_x(alignment::Horizontal::Center),
+                );
+            }
+            r.into()
+        };
+
+        // One slider row (8 cells) with a left-side label. `read` pulls
+        // the current value; `msg` wraps (slot, v) into a Message for
+        // the *fixed* mood the caller passes.
+        let slider_row = |label: &'static str,
+                          mood: Mood,
+                          read: &dyn Fn(usize) -> f32,
+                          msg: fn(Mood, usize, f32) -> Message|
+         -> Element<'_, Message> {
+            let row_h = SLIDER_H + 14.0; // slider + value text + spacing
+            let mut r = row![
+                container(text(label).size(10))
+                    .width(Length::Fixed(ROW_LABEL_W))
+                    .height(Length::Fixed(row_h))
+                    .align_x(alignment::Horizontal::Right)
+                    .align_y(alignment::Vertical::Center)
+            ]
+            .spacing(ROW_GAP)
+            .align_y(Alignment::Center);
+            for s in 0..SLOT_COUNT {
+                let v = read(s);
+                r = r.push(
+                    column![
+                        vertical_slider(0.0..=1.0, v, move |x| msg(mood, s, x))
+                            .step(0.001)
+                            .width(SLIDER_W)
+                            .height(SLIDER_H),
+                        text(format!("{v:.2}")).size(8),
+                    ]
+                    .spacing(2)
+                    .align_x(Alignment::Center)
+                    .width(Length::Fixed(CELL_W)),
+                );
+            }
+            r.into()
+        };
+
+        // One mood group: title, header row, Mood row, Balancer row.
+        let mood_group = |mood: Mood| -> Element<'_, Message> {
+            let m_idx = mood as usize;
+            column![
+                text(mood.label()).size(12),
+                header_row(),
+                slider_row(
+                    "Mood",
+                    mood,
+                    &|s| self.adaptive.mood_weight[m_idx][s],
+                    Message::SetMoodWeight,
+                ),
+                slider_row(
+                    "Bal",
+                    mood,
+                    &|s| self.adaptive.balancer_mask[m_idx][s],
+                    Message::SetBalancerMask,
+                ),
+            ]
+            .spacing(2)
+            .into()
+        };
+
+        // Per-source total-volume column on the far right. One vertical
+        // bar per slot reading the live `gain` the adaptive mixer
+        // publishes. Lays out as a single row so its width matches the
+        // mood groups' slider rows and the heights line up visually.
+        let vol_height = SLIDER_H + 14.0;
+        let mut vol_header = row![].spacing(ROW_GAP).align_y(Alignment::Center);
+        for s in 0..SLOT_COUNT {
+            vol_header = vol_header.push(
+                container(text(format!("{s}")).size(10))
+                    .width(Length::Fixed(CELL_W))
+                    .align_x(alignment::Horizontal::Center),
+            );
+        }
+        let mut vol_bars = row![].spacing(ROW_GAP).align_y(Alignment::End);
+        for s in 0..SLOT_COUNT {
+            let g = self
+                .params
+                .sources
+                .get(s)
+                .map(|p| p.load_gain())
+                .unwrap_or(0.0);
+            vol_bars = vol_bars.push(
+                column![
+                    canvas(VolumeBar { value: g })
+                        .width(Length::Fixed(SLIDER_W))
+                        .height(Length::Fixed(vol_height)),
+                    text(format!("{g:.2}")).size(8),
+                ]
+                .spacing(2)
+                .align_x(Alignment::Center)
+                .width(Length::Fixed(CELL_W)),
+            );
+        }
+        let volumes = column![text("TOTAL VOLUME").size(12), vol_header, vol_bars].spacing(2);
+
+        row![
+            mood_group(Mood::Dark),
+            Space::with_width(Length::Fixed(16.0)),
+            mood_group(Mood::Neutral),
+            Space::with_width(Length::Fixed(16.0)),
+            mood_group(Mood::Bright),
+            Space::with_width(Length::Fill),
+            volumes,
+        ]
+        .spacing(8)
+        .align_y(Alignment::Start)
+        .into()
+    }
+
+    /// Sources column on the left + horizontally-scrollable timeline on the right.
+    fn main_body_row(&self) -> Element<'_, Message> {
+
         let recording = self.recorder.as_ref().map(|r| r.recording).unwrap_or(false);
         let preview = self.recorder.as_ref().and_then(|r| r.last_preview.as_ref());
         let sr = self.engine.as_ref().map(|e| e.sample_rate).unwrap_or(48_000.0);
 
         // Active grid context: recording snapshot, or loaded take, else nothing.
-        // We always use the LIVE UI meter for the grid so the user can correct
-        // a wrong meter after the fact — the recorded `time_sig_num` is kept
-        // on the take as metadata but not used for display.
         let (bpm, start_pulses, take_len_seconds) = if recording {
             let elapsed = preview
                 .map(|p| {
@@ -911,7 +1375,6 @@ impl State {
         };
 
         let beats_per_bar = self.time_sig_num.max(1);
-        // Unit = one bar when MIDI sync is up, else one second (graceful fallback).
         let unit_seconds = if bpm > 0.0 {
             60.0 / bpm * beats_per_bar as f32
         } else {
@@ -924,8 +1387,6 @@ impl State {
             0.0
         };
         let take_len_units = take_len_seconds / unit_seconds;
-        // The loaded take can be dragged horizontally by the user; the live
-        // preview during recording always renders at the recorded position.
         let offset_units = if recording {
             0.0
         } else {
@@ -934,37 +1395,35 @@ impl State {
         let effective_start_units = take_start_units + offset_units;
         let total_units = (effective_start_units + take_len_units + TIMELINE_PADDING_UNITS)
             .max(MIN_UNITS_VISIBLE);
-        // Zoom changes the per-unit pixel count; clamp so very low zoom
-        // still fills the viewport rather than leaving dead space.
         let total_pixels = (total_units * pixels_per_unit).max(MIN_TIMELINE_PIXELS);
         let take_start_x = effective_start_units * pixels_per_unit;
         let take_end_x = (effective_start_units + take_len_units) * pixels_per_unit;
         let unit_label = if bpm > 0.0 { "bar" } else { "s" };
-
         let playhead_x = if !recording && self.playback.has_take() {
             let pos_s = self.playback.position() as f32 / sr;
-            let units = effective_start_units + pos_s / unit_seconds;
-            Some(units * pixels_per_unit)
+            Some((effective_start_units + pos_s / unit_seconds) * pixels_per_unit)
         } else {
             None
         };
-
         let draggable = !recording && self.playback.has_take();
 
-        // Left labels column: blank ruler-height spacer, then "Src N" per lane.
-        let mut labels = column![].push(Space::with_height(Length::Fixed(RULER_HEIGHT)));
+        // Sources column on the LEFT — each row aligned with its lane.
+        let mut sources_col = column![]
+            .spacing(0)
+            .push(Space::with_height(Length::Fixed(RULER_HEIGHT)));
         for i in 0..self.num_sources {
-            labels = labels.push(
-                container(text(format!("Src {}", i + 1)).size(11))
+            sources_col = sources_col.push(
+                container(self.source_row(i))
                     .height(Length::Fixed(LANE_HEIGHT))
                     .padding([0, 6])
                     .align_y(alignment::Vertical::Center),
             );
         }
 
-        // Horizontally-scrollable content: ruler on top, one lane per source.
-        let mut timeline_col =
-            column![].push(ruler_view(total_pixels, unit_label, pixels_per_unit));
+        // Timeline column on the RIGHT (horizontally scrollable): ruler + lanes.
+        let mut timeline_col = column![]
+            .spacing(0)
+            .push(ruler_view(total_pixels, unit_label, pixels_per_unit));
         for i in 0..self.num_sources {
             let env: Vec<f32> = if recording {
                 preview.map(|p| p.snapshot(i)).unwrap_or_default()
@@ -989,7 +1448,7 @@ impl State {
         }
 
         row![
-            labels.width(Length::Fixed(TIMELINE_LABEL_WIDTH)),
+            sources_col.width(Length::Fixed(SOURCES_COL_WIDTH)),
             scrollable(timeline_col)
                 .direction(scrollable::Direction::Horizontal(
                     scrollable::Scrollbar::default(),
@@ -1048,21 +1507,21 @@ impl State {
         row![
             text_input(&format!("Src {}", i + 1), &layer_name)
                 .on_input(move |s| Message::SetLayerName(i, s))
-                .size(13)
-                .width(Length::Fixed(96.0)),
-            meter_bar(peak_db, 180.0),
+                .size(12)
+                .width(Length::Fixed(80.0)),
+            meter_bar(peak_db, 130.0),
             arm,
             checkbox("M", muted).on_toggle(move |b| Message::SetMute(i, b)),
             checkbox("S", soloed).on_toggle(move |b| Message::SetSolo(i, b)),
             checkbox("\u{00D8}", inverted).on_toggle(move |b| Message::SetInvert(i, b)),
             slider(GAIN_DB_MIN..=GAIN_DB_MAX, gain_db, move |v| Message::SetGainDb(i, v))
                 .step(0.5)
-                .width(Length::Fixed(140.0)),
-            text(format!("{gain_db:+.1} dB")).width(Length::Fixed(60.0)),
-            text(lufs_str).size(11).width(Length::Fixed(80.0)),
-            text(delta_str).size(11).width(Length::Fixed(80.0)),
+                .width(Length::Fixed(100.0)),
+            text(format!("{gain_db:+.1} dB")).size(11).width(Length::Fixed(50.0)),
+            text(lufs_str).size(11).width(Length::Fixed(70.0)),
+            text(delta_str).size(11).width(Length::Fixed(70.0)),
         ]
-        .spacing(8)
+        .spacing(6)
         .align_y(Alignment::Center)
         .into()
     }
@@ -1080,6 +1539,7 @@ fn meter_bar(peak_db: f32, width: f32) -> Element<'static, Message> {
         .into()
 }
 
+#[allow(dead_code)] // ex-helper from the old layout; kept for future detail panes
 fn pick_row<'a>(
     label: &'a str,
     options: &'a [String],
@@ -1400,5 +1860,157 @@ fn ruler_view(
     })
     .width(Length::Fixed(total_pixels))
     .height(Length::Fixed(RULER_HEIGHT))
+    .into()
+}
+
+/// Curve visualizer for the mixer: shows the raw "set" curve (blue) and
+/// the "compensated" curve after target-curve normalization (orange), with
+/// a vertical marker at the current intensity. Pass `comp_pts = vec![]`
+/// to draw only the raw curve (used by the target-curve popover).
+struct CurveDisplay {
+    raw_pts: Vec<f32>,
+    comp_pts: Vec<f32>,
+    intensity: f32,
+}
+
+impl canvas::Program<Message> for CurveDisplay {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &(),
+        renderer: &Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        let mut frame = canvas::Frame::new(renderer, bounds.size());
+        let (w, h) = (bounds.width, bounds.height);
+
+        // Background + border.
+        frame.fill_rectangle(
+            Point::new(0.0, 0.0),
+            bounds.size(),
+            Color::from_rgb(0.09, 0.10, 0.12),
+        );
+        let grid = Color::from_rgb(0.22, 0.23, 0.27);
+        // Horizontal grid at 0.25, 0.5, 0.75 (of 1.0).
+        for f in [0.25_f32, 0.5, 0.75] {
+            let y = h - f * h;
+            frame.fill_rectangle(Point::new(0.0, y), Size::new(w, 1.0), grid);
+        }
+        // Vertical grid at 0.25, 0.5, 0.75 of intensity.
+        for f in [0.25_f32, 0.5, 0.75] {
+            let x = f * w;
+            frame.fill_rectangle(Point::new(x, 0.0), Size::new(1.0, h), grid);
+        }
+
+        // y-axis fixed at 0..1; any compensated value above 1 clips at the
+        // top edge (visible as a flat line riding the top).
+        let draw_polyline = |frame: &mut canvas::Frame, pts: &[f32], color: Color| {
+            let n = pts.len();
+            if n < 2 {
+                return;
+            }
+            let path = canvas::Path::new(|b| {
+                for (i, &v) in pts.iter().enumerate() {
+                    let x = i as f32 / (n - 1) as f32 * w;
+                    let y = h - v.clamp(0.0, 1.0) * h;
+                    if i == 0 {
+                        b.move_to(Point::new(x, y));
+                    } else {
+                        b.line_to(Point::new(x, y));
+                    }
+                }
+            });
+            frame.stroke(
+                &path,
+                canvas::Stroke::default().with_color(color).with_width(1.5),
+            );
+        };
+
+        // Raw "set" curve in blue, compensated in orange.
+        draw_polyline(&mut frame, &self.raw_pts, Color::from_rgb(0.45, 0.72, 1.0));
+        if !self.comp_pts.is_empty() {
+            draw_polyline(&mut frame, &self.comp_pts, Color::from_rgb(1.0, 0.66, 0.30));
+        }
+
+        // Intensity marker (vertical line).
+        let ix = self.intensity.clamp(0.0, 1.0) * w;
+        frame.stroke(
+            &canvas::Path::line(Point::new(ix, 0.0), Point::new(ix, h)),
+            canvas::Stroke::default()
+                .with_color(Color::from_rgb(1.0, 0.95, 0.55))
+                .with_width(1.0),
+        );
+
+        vec![frame.into_geometry()]
+    }
+}
+
+/// Tiny vertical bar showing a `0..1`-ish gain value. Bottom-up fill in
+/// cyan; anything above 1.0 paints a thin red cap so over-budget slots
+/// are visible at a glance.
+struct VolumeBar {
+    value: f32,
+}
+
+impl canvas::Program<Message> for VolumeBar {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &(),
+        renderer: &Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        let mut frame = canvas::Frame::new(renderer, bounds.size());
+        let (w, h) = (bounds.width, bounds.height);
+
+        // Background.
+        frame.fill_rectangle(
+            Point::new(0.0, 0.0),
+            bounds.size(),
+            Color::from_rgb(0.09, 0.10, 0.12),
+        );
+
+        let v = self.value.max(0.0);
+        let fill = v.min(1.0);
+        let fill_h = fill * h;
+        // Cyan fill rises from the bottom.
+        frame.fill_rectangle(
+            Point::new(0.0, h - fill_h),
+            Size::new(w, fill_h),
+            Color::from_rgb(0.35, 0.78, 1.0),
+        );
+        // Over-1.0 cap line at the top.
+        if v > 1.0 {
+            frame.fill_rectangle(
+                Point::new(0.0, 0.0),
+                Size::new(w, 2.0),
+                Color::from_rgb(1.0, 0.35, 0.30),
+            );
+        }
+
+        vec![frame.into_geometry()]
+    }
+}
+
+fn curve_view(
+    raw_pts: Vec<f32>,
+    comp_pts: Vec<f32>,
+    intensity: f32,
+    width: f32,
+    height: f32,
+) -> Element<'static, Message> {
+    canvas(CurveDisplay {
+        raw_pts,
+        comp_pts,
+        intensity,
+    })
+    .width(Length::Fixed(width))
+    .height(Length::Fixed(height))
     .into()
 }

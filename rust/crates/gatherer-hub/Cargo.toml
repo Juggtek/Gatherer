@@ -31,3 +31,7 @@ ebur128 = "0.1"
 # Session save/load — TOML next to the session's audio folders.
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+# Native file pickers for template import (macOS NSOpenPanel etc.). Used
+# synchronously — the dialog blocks the iced event loop while it's open,
+# which is normal UX for a modal "pick a file".
+rfd = "0.15"

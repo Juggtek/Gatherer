@@ -17,6 +17,7 @@ mod params;
 mod playback;
 mod recording;
 mod session;
+mod template;
 
 use app::State;
 
@@ -25,8 +26,8 @@ fn main() -> iced::Result {
         .subscription(State::subscription)
         .antialiasing(true)
         .window(iced::window::Settings {
-            size: iced::Size::new(1500.0, 980.0),
-            min_size: Some(iced::Size::new(900.0, 600.0)),
+            size: iced::Size::new(1700.0, 1000.0),
+            min_size: Some(iced::Size::new(1100.0, 700.0)),
             ..Default::default()
         })
         .run_with(|| (State::new(), iced::Task::none()))

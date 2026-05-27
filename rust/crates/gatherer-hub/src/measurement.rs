@@ -10,9 +10,14 @@ use ebur128::{EbuR128, Mode};
 
 #[derive(Debug, Clone, Copy)]
 pub struct LufsMeasurement {
-    pub integrated: f64,      // LUFS, NEG_INFINITY for silence
-    pub max_short_term: f64,  // max LUFS over 3 s windows
-    pub max_momentary: f64,   // max LUFS over 400 ms windows
+    pub integrated: f64, // LUFS, NEG_INFINITY for silence
+    /// Max LUFS over 3 s windows (shown in the per-source detail panel,
+    /// currently hidden until we add it back to the layout).
+    #[allow(dead_code)]
+    pub max_short_term: f64,
+    /// Max LUFS over 400 ms windows (same).
+    #[allow(dead_code)]
+    pub max_momentary: f64,
 }
 
 impl LufsMeasurement {
