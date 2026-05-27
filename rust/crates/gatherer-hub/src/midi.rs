@@ -18,8 +18,6 @@ use std::sync::Arc;
 pub const PPQN: u32 = 24;
 /// Smooth BPM over one beat of clock pulses.
 const SMOOTH_PULSES: usize = PPQN as usize;
-/// v1 assumption — time-signature controls come later.
-pub const BEATS_PER_BAR: u32 = 4;
 
 pub struct GridState {
     bpm: AtomicF32,
@@ -58,16 +56,19 @@ impl GridState {
         self.connected.load(Ordering::Relaxed)
     }
 
-    /// (bar, beat), both 1-based, under the v1 4/4 assumption.
-    pub fn bar_beat(&self) -> (u32, u32) {
-        bar_beat_for(self.pulses())
+    /// (bar, beat), both 1-based, using the supplied numerator (beats per
+    /// bar). MIDI Clock doesn't carry the time signature, so the UI
+    /// supplies it — the user sets it to match the DAW.
+    pub fn bar_beat(&self, beats_per_bar: u32) -> (u32, u32) {
+        bar_beat_for(self.pulses(), beats_per_bar.max(1))
     }
 }
 
-fn bar_beat_for(pulses: u64) -> (u32, u32) {
+fn bar_beat_for(pulses: u64, beats_per_bar: u32) -> (u32, u32) {
     let total_beats = pulses / PPQN as u64;
-    let bar = (total_beats / BEATS_PER_BAR as u64) as u32 + 1;
-    let beat = (total_beats % BEATS_PER_BAR as u64) as u32 + 1;
+    let bpb = beats_per_bar.max(1) as u64;
+    let bar = (total_beats / bpb) as u32 + 1;
+    let beat = (total_beats % bpb) as u32 + 1;
     (bar, beat)
 }
 
@@ -179,12 +180,20 @@ mod tests {
 
     #[test]
     fn bar_beat_arithmetic_4_4() {
-        assert_eq!(bar_beat_for(0), (1, 1));
-        assert_eq!(bar_beat_for(23), (1, 1)); // mid-beat
-        assert_eq!(bar_beat_for(24), (1, 2)); // 1 beat = 24 pulses
-        assert_eq!(bar_beat_for(72), (1, 4)); // 3 beats
-        assert_eq!(bar_beat_for(96), (2, 1)); // 4 beats = 1 bar
-        assert_eq!(bar_beat_for(96 * 3), (4, 1));
+        assert_eq!(bar_beat_for(0, 4), (1, 1));
+        assert_eq!(bar_beat_for(23, 4), (1, 1)); // mid-beat
+        assert_eq!(bar_beat_for(24, 4), (1, 2)); // 1 beat = 24 pulses
+        assert_eq!(bar_beat_for(72, 4), (1, 4)); // 3 beats
+        assert_eq!(bar_beat_for(96, 4), (2, 1)); // 4 beats = 1 bar
+        assert_eq!(bar_beat_for(96 * 3, 4), (4, 1));
+    }
+
+    #[test]
+    fn bar_beat_arithmetic_5_4() {
+        assert_eq!(bar_beat_for(0, 5), (1, 1));
+        assert_eq!(bar_beat_for(24 * 4, 5), (1, 5)); // 4 beats into bar 1
+        assert_eq!(bar_beat_for(24 * 5, 5), (2, 1)); // exactly one 5/4 bar
+        assert_eq!(bar_beat_for(24 * 12, 5), (3, 3)); // 2 bars + 2 beats
     }
 
     #[test]
@@ -200,7 +209,7 @@ mod tests {
         // SPP 16 = 16 sixteenths = 4 beats = 1 bar in 4/4 = 96 pulses.
         on_message(0, &[0xF2, 16, 0], &mut parser);
         assert_eq!(grid.pulses(), 96);
-        assert_eq!(grid.bar_beat(), (2, 1));
+        assert_eq!(grid.bar_beat(4), (2, 1));
     }
 
     #[test]

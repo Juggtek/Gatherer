@@ -15,12 +15,17 @@ const ENVELOPE_BUCKETS: usize = 1200;
 
 /// Decoded take: interleaved-stereo samples per recorded source, plus
 /// the MIDI grid state captured at the moment recording started (so the
-/// UI can draw bar lines over the waveforms).
+/// UI can draw bar lines over the waveforms). `time_sig_num` is the
+/// beats-per-bar in effect at the time of recording.
 pub struct PlaybackData {
     pub sources: Vec<Arc<Vec<f32>>>,
     pub len_frames: usize,
     pub start_pulses: u64,
     pub bpm: f32,
+    /// Meter at record-start (kept for future session persistence; the
+    /// timeline display uses the live UI meter so it can be corrected).
+    #[allow(dead_code)]
+    pub time_sig_num: u32,
 }
 
 /// Shared transport + buffers between UI (control + load) and audio (read).
@@ -108,6 +113,7 @@ pub fn load_take(
     sources: &[usize],
     start_pulses: u64,
     bpm: f32,
+    time_sig_num: u32,
 ) -> Result<(PlaybackData, Vec<(usize, Vec<f32>)>), String> {
     let mut bufs = Vec::with_capacity(sources.len());
     let mut envs = Vec::with_capacity(sources.len());
@@ -129,6 +135,7 @@ pub fn load_take(
             len_frames: max_len,
             start_pulses,
             bpm,
+            time_sig_num: time_sig_num.max(1),
         },
         envs,
     ))
@@ -183,6 +190,7 @@ mod tests {
             len_frames: 100,
             start_pulses: 0,
             bpm: 0.0,
+            time_sig_num: 4,
         });
         assert!(pb.has_take());
         pb.play();

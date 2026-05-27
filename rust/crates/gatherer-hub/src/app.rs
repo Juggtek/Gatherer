@@ -6,7 +6,7 @@
 //! widgets for now; FIELD's canvas meters/faders are a later polish pass.
 
 use crate::audio::{self, AudioEngine};
-use crate::midi::{self, MidiSync, BEATS_PER_BAR, PPQN};
+use crate::midi::{self, MidiSync, PPQN};
 use crate::params::{linear_to_db, HubParams, GAIN_DB_MAX, GAIN_DB_MIN};
 use crate::playback::Playback;
 use crate::recording::{RecordState, RecorderControl};
@@ -32,6 +32,9 @@ const RULER_HEIGHT: f32 = 22.0;
 const TIMELINE_LABEL_WIDTH: f32 = 64.0;
 const MIN_UNITS_VISIBLE: f32 = 16.0;
 const TIMELINE_PADDING_UNITS: f32 = 2.0;
+/// At any zoom, ensure the timeline content fills at least this much
+/// horizontal pixels so low zoom doesn't leave dead viewport space.
+const MIN_TIMELINE_PIXELS: f32 = 1100.0;
 
 /// UI meter tick — matches FIELD's ~30 Hz diagnostics cadence.
 const TICK_MS: u64 = 33;
@@ -53,6 +56,14 @@ pub enum Message {
     PlaybackPlay,
     PlaybackPause,
     PlaybackStop,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
+    TimeSigNumChanged(i32),
+    SetPlayheadUnits(f32),
+    SetTakeOffsetUnits(f32),
+    CommitTakeOffset,
+    ToggleSnap(bool),
     Tick,
 }
 
@@ -83,6 +94,20 @@ pub struct State {
     /// resulting waveforms.
     take_start_pulses: u64,
     take_start_bpm: f32,
+    take_start_time_sig: u32,
+
+    /// Timeline view state.
+    zoom: f32,
+    /// Beats-per-bar (numerator) — set by the user to match the DAW; MIDI
+    /// Clock doesn't transmit time signature in real time.
+    time_sig_num: u32,
+    /// User-applied horizontal offset of the loaded take, in units (bars
+    /// when MIDI synced, seconds otherwise). Updated continuously during a
+    /// drag, snapped on release (unless `snap_to_grid` is off).
+    take_user_offset_units: f32,
+    /// If true, dragged clips snap to the nearest bar on release. Toggle
+    /// off for free positioning.
+    snap_to_grid: bool,
 }
 
 impl State {
@@ -114,6 +139,11 @@ impl State {
             pending_load_at: None,
             take_start_pulses: 0,
             take_start_bpm: 0.0,
+            take_start_time_sig: 4,
+            zoom: 1.0,
+            time_sig_num: 4,
+            take_user_offset_units: 0.0,
+            snap_to_grid: true,
         };
         state.restart_engine();
         state
@@ -211,9 +241,9 @@ impl State {
                     (false, false)
                 };
                 if !was && now {
-                    // Snapshot MIDI grid for bar alignment, pause playback,
-                    // and clear the previous loaded waveforms — the live
-                    // preview now feeds the lanes.
+                    // Snapshot MIDI grid + time signature for bar alignment,
+                    // pause playback, clear previous loaded waveforms (live
+                    // preview feeds the lanes from here).
                     self.take_start_pulses = self
                         .midi
                         .as_ref()
@@ -224,6 +254,8 @@ impl State {
                         .as_ref()
                         .map(|m| m.state.bpm())
                         .unwrap_or(0.0);
+                    self.take_start_time_sig = self.time_sig_num;
+                    self.take_user_offset_units = 0.0;
                     self.playback.pause();
                     self.waveforms.clear();
                 }
@@ -235,6 +267,33 @@ impl State {
             Message::PlaybackPlay => self.playback.play(),
             Message::PlaybackPause => self.playback.pause(),
             Message::PlaybackStop => self.playback.stop(),
+            Message::ZoomIn => {
+                self.zoom = (self.zoom * 1.5).min(8.0);
+            }
+            Message::ZoomOut => {
+                self.zoom = (self.zoom / 1.5).max(0.15);
+            }
+            Message::ZoomReset => {
+                self.zoom = 1.0;
+            }
+            Message::TimeSigNumChanged(delta) => {
+                let next = (self.time_sig_num as i32 + delta).clamp(1, 32);
+                self.time_sig_num = next as u32;
+            }
+            Message::SetPlayheadUnits(units) => self.set_playhead_units(units),
+            Message::SetTakeOffsetUnits(units) => {
+                self.take_user_offset_units = units;
+            }
+            Message::CommitTakeOffset => {
+                // Snap to the nearest bar (or second when no MIDI sync) when
+                // snap is on; otherwise leave the free-positioned value.
+                if self.snap_to_grid {
+                    self.take_user_offset_units = self.take_user_offset_units.round();
+                }
+            }
+            Message::ToggleSnap(on) => {
+                self.snap_to_grid = on;
+            }
             Message::Tick => {
                 self.refresh_meters();
                 if let Some(t) = self.pending_load_at {
@@ -275,14 +334,49 @@ impl State {
         if armed.is_empty() {
             return;
         }
-        match crate::playback::load_take(&dir, &armed, self.take_start_pulses, self.take_start_bpm)
-        {
+        match crate::playback::load_take(
+            &dir,
+            &armed,
+            self.take_start_pulses,
+            self.take_start_bpm,
+            self.take_start_time_sig,
+        ) {
             Ok((data, envs)) => {
                 self.playback.set_take(data);
                 self.waveforms = envs.into_iter().collect();
+                self.take_user_offset_units = 0.0;
             }
             Err(e) => self.error = Some(format!("load take: {e}")),
         }
+    }
+
+    /// Click on the ruler/lane → seek the loaded take to that musical
+    /// position. Uses the live UI meter and the take's bpm, and accounts
+    /// for the user's drag offset so clicks line up with the visual take.
+    fn set_playhead_units(&self, units: f32) {
+        let sr = self.engine.as_ref().map(|e| e.sample_rate).unwrap_or(48_000.0);
+        let Some(d) = self.playback.snapshot() else {
+            return;
+        };
+        let bpm = d.bpm;
+        let bpb = self.time_sig_num.max(1);
+        let take_start_units = if bpm > 0.0 {
+            d.start_pulses as f32 / (PPQN * bpb) as f32
+        } else {
+            0.0
+        };
+        let unit_seconds = if bpm > 0.0 {
+            60.0 / bpm * bpb as f32
+        } else {
+            1.0
+        };
+        // The take has been visually shifted by the user's drag — clicks must
+        // align to that, not to the recorded start.
+        let visual_start_units = take_start_units + self.take_user_offset_units;
+        let offset_units = (units - visual_start_units).max(0.0);
+        let frames = (offset_units * unit_seconds * sr) as u64;
+        let clamped = frames.min(d.len_frames as u64);
+        self.playback.set_position(clamped);
     }
 
     pub fn view(&self) -> Element<'_, Message> {
@@ -299,39 +393,76 @@ impl State {
             Message::OutputDeviceSelected,
         );
 
-        let mut body = column![
+        let mut body = column![column![
             text("Gatherer Hub").size(28),
             text("Each stereo input pair is one gathered source. The DAW's PDC \
                   delivers them already aligned.")
                 .size(12),
-            input_picker,
-            output_picker,
         ]
+        .spacing(2)]
         .spacing(10);
 
+        // ---- LEFT column: pickers + MIDI + MASTER + Meter + Zoom + Snap. ----
+        let master_block = row![
+            text("MASTER").size(14).width(Length::Fixed(70.0)),
+            meter_bar(self.master_peak_db),
+            slider(GAIN_DB_MIN..=GAIN_DB_MAX, self.master_gain_db, Message::SetMasterGainDb)
+                .step(0.5)
+                .width(Length::Fixed(160.0)),
+            text(format!("{:+.1} dB", self.master_gain_db)).width(Length::Fixed(70.0)),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center);
+
+        let meter_block = row![
+            text("Meter").width(Length::Fixed(50.0)),
+            button(text("\u{2212}")).on_press(Message::TimeSigNumChanged(-1)),
+            text(format!("{}/4", self.time_sig_num))
+                .width(Length::Fixed(40.0))
+                .align_x(alignment::Horizontal::Center),
+            button(text("+")).on_press(Message::TimeSigNumChanged(1)),
+            text("(match your DAW)").size(11),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+
+        let zoom_block = row![
+            text("Zoom").width(Length::Fixed(50.0)),
+            button(text("\u{2212}")).on_press(Message::ZoomOut),
+            text(format!("{:>4.0}%", self.zoom * 100.0))
+                .width(Length::Fixed(56.0))
+                .align_x(alignment::Horizontal::Center),
+            button(text("+")).on_press(Message::ZoomIn),
+            button(text("100%")).on_press(Message::ZoomReset),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+
+        let snap_block = row![
+            text("Snap").width(Length::Fixed(50.0)),
+            checkbox("Snap to bars on release", self.snap_to_grid)
+                .on_toggle(Message::ToggleSnap),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+
+        let mut left_col = column![]
+            .spacing(8)
+            .push(input_picker)
+            .push(output_picker)
+            .push(text(midi_status_line(self.midi.as_ref(), self.time_sig_num)).size(13));
         if let Some(err) = &self.error {
-            body = body.push(text(format!("audio error: {err}")).size(13));
+            left_col = left_col.push(text(format!("audio error: {err}")).size(13));
         }
+        let left_col = left_col
+            .push(Space::with_height(4))
+            .push(master_block)
+            .push(meter_block)
+            .push(zoom_block)
+            .push(snap_block)
+            .width(Length::Fixed(580.0));
 
-        // MIDI sync status (route your DAW's MIDI clock to "Gatherer Hub").
-        body = body.push(text(midi_status_line(self.midi.as_ref())).size(13));
-
-        // Master row.
-        body = body.push(Space::with_height(6));
-        body = body.push(
-            row![
-                text("MASTER").size(14).width(Length::Fixed(70.0)),
-                meter_bar(self.master_peak_db),
-                slider(GAIN_DB_MIN..=GAIN_DB_MAX, self.master_gain_db, Message::SetMasterGainDb)
-                    .step(0.5)
-                    .width(Length::Fixed(160.0)),
-                text(format!("{:+.1} dB", self.master_gain_db)).width(Length::Fixed(70.0)),
-            ]
-            .spacing(10)
-            .align_y(Alignment::Center),
-        );
-
-        // Recording control row.
+        // ---- RIGHT column: Sources + Record/Transport. ----
         let (recording, rec_status) = match &self.recorder {
             Some(r) if r.recording => (
                 true,
@@ -349,42 +480,36 @@ impl State {
             ),
             None => (false, "no engine".to_string()),
         };
-        body = body.push(
-            row![
-                button(text(if recording { "Stop" } else { "Record" }))
-                    .on_press(Message::ToggleRecord),
-                text(rec_status).size(13),
-            ]
-            .spacing(10)
-            .align_y(Alignment::Center),
-        );
 
-        // Playback transport (shown once a take is loaded).
-        if self.playback.has_take() {
-            let sr = self.engine.as_ref().map(|e| e.sample_rate).unwrap_or(48_000.0);
-            let pos_s = self.playback.position() as f32 / sr;
-            let len_s = self.playback.len_frames() as f32 / sr;
-            body = body.push(
-                row![
-                    button(text("\u{25B6} Play")).on_press(Message::PlaybackPlay),
-                    button(text("Pause")).on_press(Message::PlaybackPause),
-                    button(text("Stop")).on_press(Message::PlaybackStop),
-                    text(format!("{pos_s:.1}s / {len_s:.1}s")).size(13),
-                ]
-                .spacing(8)
-                .align_y(Alignment::Center),
-            );
-        }
+        let sr = self.engine.as_ref().map(|e| e.sample_rate).unwrap_or(48_000.0);
+        let pos_s = self.playback.position() as f32 / sr;
+        let len_s = self.playback.len_frames() as f32 / sr;
 
-        // Per-source mixer rows (stacked directly; the window is large enough).
-        body = body.push(Space::with_height(8));
-        body = body.push(text("Sources").size(14));
+        let transport_block = row![
+            button(text(if recording { "Stop" } else { "Record" }))
+                .on_press(Message::ToggleRecord),
+            text(rec_status).size(13),
+            Space::with_width(Length::Fixed(16.0)),
+            button(text("\u{25B6} Play")).on_press(Message::PlaybackPlay),
+            button(text("Pause")).on_press(Message::PlaybackPause),
+            button(text("Stop")).on_press(Message::PlaybackStop),
+            text(format!("{pos_s:.1}s / {len_s:.1}s")).size(13),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+
+        let mut right_col = column![].spacing(4).push(text("Sources").size(14));
         for i in 0..self.num_sources {
-            body = body.push(self.source_row(i));
+            right_col = right_col.push(self.source_row(i));
         }
+        right_col = right_col.push(Space::with_height(6));
+        right_col = right_col.push(transport_block);
+        let right_col = right_col.width(Length::Fill);
+
+        body = body.push(row![left_col, right_col].spacing(20));
 
         // Bar-based timeline (scrollable horizontally; takes positioned at
-        // their actual bar offset on the DAW's grid).
+        // their actual bar offset on the DAW's grid; click to seek).
         if self.num_sources > 0 {
             body = body.push(Space::with_height(10));
             body = body.push(text("Timeline").size(14));
@@ -400,6 +525,9 @@ impl State {
         let sr = self.engine.as_ref().map(|e| e.sample_rate).unwrap_or(48_000.0);
 
         // Active grid context: recording snapshot, or loaded take, else nothing.
+        // We always use the LIVE UI meter for the grid so the user can correct
+        // a wrong meter after the fact — the recorded `time_sig_num` is kept
+        // on the take as metadata but not used for display.
         let (bpm, start_pulses, take_len_seconds) = if recording {
             let elapsed = preview
                 .map(|p| {
@@ -423,32 +551,46 @@ impl State {
             (0.0, 0, 0.0)
         };
 
+        let beats_per_bar = self.time_sig_num.max(1);
         // Unit = one bar when MIDI sync is up, else one second (graceful fallback).
         let unit_seconds = if bpm > 0.0 {
-            60.0 / bpm * BEATS_PER_BAR as f32
+            60.0 / bpm * beats_per_bar as f32
         } else {
             1.0
         };
+        let pixels_per_unit = PIXELS_PER_UNIT * self.zoom;
         let take_start_units = if bpm > 0.0 {
-            start_pulses as f32 / (PPQN * BEATS_PER_BAR) as f32
+            start_pulses as f32 / (PPQN * beats_per_bar) as f32
         } else {
             0.0
         };
         let take_len_units = take_len_seconds / unit_seconds;
-        let total_units = (take_start_units + take_len_units + TIMELINE_PADDING_UNITS)
+        // The loaded take can be dragged horizontally by the user; the live
+        // preview during recording always renders at the recorded position.
+        let offset_units = if recording {
+            0.0
+        } else {
+            self.take_user_offset_units
+        };
+        let effective_start_units = take_start_units + offset_units;
+        let total_units = (effective_start_units + take_len_units + TIMELINE_PADDING_UNITS)
             .max(MIN_UNITS_VISIBLE);
-        let total_pixels = total_units * PIXELS_PER_UNIT;
-        let take_start_x = take_start_units * PIXELS_PER_UNIT;
-        let take_end_x = (take_start_units + take_len_units) * PIXELS_PER_UNIT;
+        // Zoom changes the per-unit pixel count; clamp so very low zoom
+        // still fills the viewport rather than leaving dead space.
+        let total_pixels = (total_units * pixels_per_unit).max(MIN_TIMELINE_PIXELS);
+        let take_start_x = effective_start_units * pixels_per_unit;
+        let take_end_x = (effective_start_units + take_len_units) * pixels_per_unit;
         let unit_label = if bpm > 0.0 { "bar" } else { "s" };
 
         let playhead_x = if !recording && self.playback.has_take() {
             let pos_s = self.playback.position() as f32 / sr;
-            let units = take_start_units + pos_s / unit_seconds;
-            Some(units * PIXELS_PER_UNIT)
+            let units = effective_start_units + pos_s / unit_seconds;
+            Some(units * pixels_per_unit)
         } else {
             None
         };
+
+        let draggable = !recording && self.playback.has_take();
 
         // Left labels column: blank ruler-height spacer, then "Src N" per lane.
         let mut labels = column![].push(Space::with_height(Length::Fixed(RULER_HEIGHT)));
@@ -462,7 +604,8 @@ impl State {
         }
 
         // Horizontally-scrollable content: ruler on top, one lane per source.
-        let mut timeline_col = column![].push(ruler_view(total_pixels, unit_label));
+        let mut timeline_col =
+            column![].push(ruler_view(total_pixels, unit_label, pixels_per_unit));
         for i in 0..self.num_sources {
             let env: Vec<f32> = if recording {
                 preview.map(|p| p.snapshot(i)).unwrap_or_default()
@@ -474,7 +617,16 @@ impl State {
             } else {
                 (take_start_x, take_end_x)
             };
-            timeline_col = timeline_col.push(lane_view(total_pixels, env, sx, ex, playhead_x));
+            timeline_col = timeline_col.push(lane_view(
+                total_pixels,
+                env,
+                sx,
+                ex,
+                playhead_x,
+                pixels_per_unit,
+                offset_units,
+                draggable,
+            ));
         }
 
         row![
@@ -572,7 +724,7 @@ fn device_names(devices: Option<impl Iterator<Item = cpal::Device>>) -> Vec<Stri
         .unwrap_or_default()
 }
 
-fn midi_status_line(midi: Option<&MidiSync>) -> String {
+fn midi_status_line(midi: Option<&MidiSync>, time_sig_num: u32) -> String {
     let Some(m) = midi else {
         return "MIDI: unavailable".to_string();
     };
@@ -587,9 +739,9 @@ fn midi_status_line(midi: Option<&MidiSync>) -> String {
     } else {
         "---.- BPM".to_string()
     };
-    let (bar, beat) = s.bar_beat();
+    let (bar, beat) = s.bar_beat(time_sig_num);
     let xport = if s.playing() { "\u{25B6}" } else { "\u{25A0}" };
-    format!("MIDI {xport}  {bpm_str}   bar {bar} : beat {beat}")
+    format!("MIDI {xport}  {bpm_str}   bar {bar} : beat {beat}   meter {time_sig_num}/4")
 }
 
 /// One lane in the bar-based timeline. Coords are pixels; the take is
@@ -600,14 +752,88 @@ struct Lane {
     take_start_x: f32,
     take_end_x: f32,
     playhead_x: Option<f32>,
+    pixels_per_unit: f32,
+    /// Current committed offset for this take (units). When the user starts
+    /// a drag we anchor against this so deltas accumulate correctly.
+    take_offset_units: f32,
+    /// Only loaded takes can be dragged; live previews and empty lanes are
+    /// click-to-seek only.
+    draggable: bool,
+}
+
+/// Per-Lane drag state, persisted by iced between renders of the same
+/// canvas widget instance.
+#[derive(Debug, Default)]
+struct LaneInteraction {
+    dragging: bool,
+    anchor_x: f32,
+    anchor_offset_units: f32,
 }
 
 impl canvas::Program<Message> for Lane {
-    type State = ();
+    type State = LaneInteraction;
+
+    fn update(
+        &self,
+        state: &mut LaneInteraction,
+        event: canvas::Event,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> (canvas::event::Status, Option<Message>) {
+        match event {
+            canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                if let Some(pos) = cursor.position_in(bounds) {
+                    let on_take = self.draggable
+                        && !self.env.is_empty()
+                        && pos.x >= self.take_start_x
+                        && pos.x <= self.take_end_x;
+                    if on_take {
+                        // Begin a drag from this anchor; reset any stale state.
+                        state.dragging = true;
+                        state.anchor_x = pos.x;
+                        state.anchor_offset_units = self.take_offset_units;
+                        return (canvas::event::Status::Captured, None);
+                    } else {
+                        // Click elsewhere on the lane → seek the playhead.
+                        state.dragging = false;
+                        let units = (pos.x / self.pixels_per_unit).max(0.0);
+                        return (
+                            canvas::event::Status::Captured,
+                            Some(Message::SetPlayheadUnits(units)),
+                        );
+                    }
+                }
+            }
+            canvas::Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                if state.dragging {
+                    if let Some(pos) = cursor.position_in(bounds) {
+                        let delta_x = pos.x - state.anchor_x;
+                        let delta_units = delta_x / self.pixels_per_unit;
+                        let new_offset = state.anchor_offset_units + delta_units;
+                        return (
+                            canvas::event::Status::Captured,
+                            Some(Message::SetTakeOffsetUnits(new_offset)),
+                        );
+                    }
+                }
+            }
+            canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                if state.dragging {
+                    state.dragging = false;
+                    return (
+                        canvas::event::Status::Captured,
+                        Some(Message::CommitTakeOffset),
+                    );
+                }
+            }
+            _ => {}
+        }
+        (canvas::event::Status::Ignored, None)
+    }
 
     fn draw(
         &self,
-        _state: &(),
+        _state: &LaneInteraction,
         renderer: &Renderer,
         _theme: &Theme,
         bounds: Rectangle,
@@ -629,7 +855,7 @@ impl canvas::Program<Message> for Lane {
             Color::from_rgb(0.25, 0.26, 0.30),
         );
 
-        // Bar grid (every PIXELS_PER_UNIT). Faint verticals across the lane.
+        // Bar/unit grid. Faint verticals across the lane at the current zoom.
         let grid_color = Color::from_rgb(0.30, 0.30, 0.36);
         let mut x = 0.0;
         while x <= w {
@@ -637,7 +863,7 @@ impl canvas::Program<Message> for Lane {
                 &canvas::Path::line(Point::new(x, 0.0), Point::new(x, h)),
                 canvas::Stroke::default().with_color(grid_color).with_width(1.0),
             );
-            x += PIXELS_PER_UNIT;
+            x += self.pixels_per_unit;
         }
 
         // Waveform (normalized per take so quiet recordings still fill the lane).
@@ -677,12 +903,18 @@ fn lane_view(
     take_start_x: f32,
     take_end_x: f32,
     playhead_x: Option<f32>,
+    pixels_per_unit: f32,
+    take_offset_units: f32,
+    draggable: bool,
 ) -> Element<'static, Message> {
     canvas(Lane {
         env,
         take_start_x,
         take_end_x,
         playhead_x,
+        pixels_per_unit,
+        take_offset_units,
+        draggable,
     })
     .width(Length::Fixed(total_pixels))
     .height(Length::Fixed(LANE_HEIGHT))
@@ -691,12 +923,33 @@ fn lane_view(
 
 /// Top-of-timeline ruler: tick + numeric label at every grid unit.
 /// `unit_label` is "bar" (1-based labels) or "s" (0-based seconds).
+/// Clicks emit `SetPlayheadUnits(units)` to seek the loaded take.
 struct Ruler {
     unit_label: &'static str,
+    pixels_per_unit: f32,
 }
 
 impl canvas::Program<Message> for Ruler {
     type State = ();
+
+    fn update(
+        &self,
+        _state: &mut (),
+        event: canvas::Event,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> (canvas::event::Status, Option<Message>) {
+        if let canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event {
+            if let Some(pos) = cursor.position_in(bounds) {
+                let units = (pos.x / self.pixels_per_unit).max(0.0);
+                return (
+                    canvas::event::Status::Captured,
+                    Some(Message::SetPlayheadUnits(units)),
+                );
+            }
+        }
+        (canvas::event::Status::Ignored, None)
+    }
 
     fn draw(
         &self,
@@ -724,7 +977,7 @@ impl canvas::Program<Message> for Ruler {
         let text_color = Color::from_rgb(0.85, 0.87, 0.90);
         let mut u: u32 = 0;
         loop {
-            let x = u as f32 * PIXELS_PER_UNIT;
+            let x = u as f32 * self.pixels_per_unit;
             if x > w {
                 break;
             }
@@ -747,9 +1000,16 @@ impl canvas::Program<Message> for Ruler {
     }
 }
 
-fn ruler_view(total_pixels: f32, unit_label: &'static str) -> Element<'static, Message> {
-    canvas(Ruler { unit_label })
-        .width(Length::Fixed(total_pixels))
-        .height(Length::Fixed(RULER_HEIGHT))
-        .into()
+fn ruler_view(
+    total_pixels: f32,
+    unit_label: &'static str,
+    pixels_per_unit: f32,
+) -> Element<'static, Message> {
+    canvas(Ruler {
+        unit_label,
+        pixels_per_unit,
+    })
+    .width(Length::Fixed(total_pixels))
+    .height(Length::Fixed(RULER_HEIGHT))
+    .into()
 }
