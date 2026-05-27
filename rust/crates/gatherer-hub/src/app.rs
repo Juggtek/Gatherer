@@ -14,7 +14,7 @@ use crate::recording::{RecordState, RecorderControl};
 use cpal::traits::{DeviceTrait, HostTrait};
 use iced::widget::{
     button, canvas, checkbox, column, container, progress_bar, row, scrollable, slider, text,
-    Space,
+    text_input, Space,
 };
 use iced::{
     alignment, mouse, Alignment, Color, Element, Length, Pixels, Point, Rectangle, Renderer, Size,
@@ -68,6 +68,8 @@ pub enum Message {
     ToggleSnap(bool),
     SetTargetLufs(f32),
     ExportStems,
+    SetSessionName(String),
+    SetLayerName(usize, String),
     Tick,
 }
 
@@ -121,6 +123,12 @@ pub struct State {
     last_export_dir: Option<PathBuf>,
     /// Last export error, if any.
     export_error: Option<String>,
+
+    /// User-edited session name (blank → auto-named "session-<ts>" on Record).
+    session_name: String,
+    /// User-edited per-source layer names (used for export filenames; blank
+    /// falls back to `source-NN`). Length tracks `num_sources`.
+    layer_names: Vec<String>,
 }
 
 impl State {
@@ -161,6 +169,8 @@ impl State {
             lufs_results: HashMap::new(),
             last_export_dir: None,
             export_error: None,
+            session_name: String::new(),
+            layer_names: Vec::new(),
         };
         state.restart_engine();
         state
@@ -191,6 +201,8 @@ impl State {
             Ok(engine) => {
                 self.num_sources = engine.num_sources;
                 self.source_peaks_db = vec![METER_FLOOR_DB; self.num_sources];
+                // Keep existing user-typed layer names; pad/truncate to fit.
+                self.layer_names.resize(self.num_sources, String::new());
                 self.engine = Some(engine);
                 // Replacing `recorder` drops the previous one, disconnecting
                 // the old writer thread's channel so it finalizes and exits.
@@ -250,14 +262,24 @@ impl State {
             }
             Message::ToggleRecord => {
                 let sr = self.engine.as_ref().map(|e| e.sample_rate as u32).unwrap_or(48000);
+                let session_name = self.session_name.clone();
                 let (was, now) = if let Some(r) = self.recorder.as_mut() {
                     let was = r.recording;
-                    r.toggle(sr);
+                    r.toggle(sr, &session_name);
                     (was, r.recording)
                 } else {
                     (false, false)
                 };
                 if !was && now {
+                    // Back-fill an auto-generated name into the UI so the
+                    // user sees what the session is called.
+                    if self.session_name.trim().is_empty() {
+                        if let Some(r) = self.recorder.as_ref() {
+                            if let Some(name) = r.last_session_name.as_ref() {
+                                self.session_name = name.clone();
+                            }
+                        }
+                    }
                     // Snapshot MIDI grid + time signature for bar alignment,
                     // pause playback, clear previous loaded waveforms (live
                     // preview feeds the lanes from here).
@@ -315,6 +337,15 @@ impl State {
                 self.target_lufs = lufs.clamp(-40.0, 0.0);
             }
             Message::ExportStems => self.do_export_stems(),
+            Message::SetSessionName(name) => {
+                self.session_name = name;
+            }
+            Message::SetLayerName(i, name) => {
+                if i >= self.layer_names.len() {
+                    self.layer_names.resize(i + 1, String::new());
+                }
+                self.layer_names[i] = name;
+            }
             Message::Tick => {
                 self.refresh_meters();
                 if let Some(t) = self.pending_load_at {
@@ -348,15 +379,17 @@ impl State {
         let Some(r) = self.recorder.as_ref() else {
             return;
         };
-        let Some(dir) = r.last_session.clone() else {
+        let Some(session_root) = r.last_session.clone() else {
             return;
         };
         let armed = r.last_armed.clone();
         if armed.is_empty() {
             return;
         }
+        // Recording WAVs live under `<session_root>/recording/`.
+        let recording_dir = session_root.join("recording");
         match crate::playback::load_take(
-            &dir,
+            &recording_dir,
             &armed,
             self.take_start_pulses,
             self.take_start_bpm,
@@ -400,6 +433,10 @@ impl State {
         let Some(rec) = self.recorder.as_ref() else {
             return;
         };
+        let Some(session_root) = rec.last_session.clone() else {
+            self.export_error = Some("no recorded session yet".into());
+            return;
+        };
         let sr = self
             .engine
             .as_ref()
@@ -408,7 +445,9 @@ impl State {
         match crate::export::export_stems(
             &d,
             sr,
+            &session_root,
             &rec.last_armed,
+            &self.layer_names,
             &self.lufs_results,
             self.target_lufs as f64,
         ) {
@@ -475,7 +514,7 @@ impl State {
         // ---- LEFT column: pickers + MIDI + MASTER + Meter + Zoom + Snap. ----
         let master_block = row![
             text("MASTER").size(14).width(Length::Fixed(70.0)),
-            meter_bar(self.master_peak_db),
+            meter_bar(self.master_peak_db, 220.0),
             slider(GAIN_DB_MIN..=GAIN_DB_MAX, self.master_gain_db, Message::SetMasterGainDb)
                 .step(0.5)
                 .width(Length::Fixed(160.0)),
@@ -551,30 +590,49 @@ impl State {
 
         let mut measurements_block = column![].spacing(2);
         if !self.lufs_results.is_empty() {
-            measurements_block =
-                measurements_block.push(text("Measurements (max over take)").size(12));
+            measurements_block = measurements_block
+                .push(text("Measurements (max over take) + normalization Δ").size(12));
             for src in 0..self.num_sources {
                 if let Some(m) = self.lufs_results.get(&src) {
+                    let label = self
+                        .layer_names
+                        .get(src)
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| format!("Src {}", src + 1));
                     let line = if m.integrated.is_finite() {
+                        let delta = self.target_lufs as f64 - m.integrated;
                         format!(
-                            "Src {}:  I {:>6.1}   S {:>6.1}   M {:>6.1}",
-                            src + 1,
+                            "{}:  I {:>6.1}   S {:>6.1}   M {:>6.1}   \u{0394} {:>+5.1} dB",
+                            label,
                             m.integrated,
                             m.max_short_term,
-                            m.max_momentary
+                            m.max_momentary,
+                            delta
                         )
                     } else {
-                        format!("Src {}:  \u{2014}", src + 1)
+                        format!("{}:  \u{2014}", label)
                     };
                     measurements_block = measurements_block.push(text(line).size(11));
                 }
             }
         }
 
+        let session_row = row![
+            text("Session").width(Length::Fixed(60.0)),
+            text_input("session-<auto>", &self.session_name)
+                .on_input(Message::SetSessionName)
+                .width(Length::Fixed(360.0)),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+
         let mut left_col = column![]
             .spacing(8)
             .push(input_picker)
             .push(output_picker)
+            .push(session_row)
             .push(text(midi_status_line(self.midi.as_ref(), self.time_sig_num)).size(13));
         if let Some(err) = &self.error {
             left_col = left_col.push(text(format!("audio error: {err}")).size(13));
@@ -791,33 +849,47 @@ impl State {
             arm.on_toggle(move |b| Message::SetArm(i, b))
         };
 
-        // Integrated LUFS readout (per-source) — compact; '—' for silence/none.
-        let lufs_str = self
+        // Integrated LUFS + Δ (gain to reach target) readouts.
+        let (lufs_str, delta_str) = self
             .lufs_results
             .get(&i)
             .map(|m| {
                 if m.integrated.is_finite() {
-                    format!("{:>6.1} LUFS", m.integrated)
+                    let delta = self.target_lufs as f64 - m.integrated;
+                    (
+                        format!("{:>6.1} LUFS", m.integrated),
+                        format!("\u{0394} {:>+5.1} dB", delta),
+                    )
                 } else {
-                    "  \u{2014}    LUFS".to_string()
+                    ("  \u{2014}    LUFS".to_string(), String::new())
                 }
             })
             .unwrap_or_default();
 
+        let layer_name = self
+            .layer_names
+            .get(i)
+            .cloned()
+            .unwrap_or_default();
+
         row![
-            text(format!("Src {}", i + 1)).size(14).width(Length::Fixed(70.0)),
-            meter_bar(peak_db),
+            text_input(&format!("Src {}", i + 1), &layer_name)
+                .on_input(move |s| Message::SetLayerName(i, s))
+                .size(13)
+                .width(Length::Fixed(96.0)),
+            meter_bar(peak_db, 180.0),
             arm,
             checkbox("M", muted).on_toggle(move |b| Message::SetMute(i, b)),
             checkbox("S", soloed).on_toggle(move |b| Message::SetSolo(i, b)),
             checkbox("\u{00D8}", inverted).on_toggle(move |b| Message::SetInvert(i, b)),
             slider(GAIN_DB_MIN..=GAIN_DB_MAX, gain_db, move |v| Message::SetGainDb(i, v))
                 .step(0.5)
-                .width(Length::Fixed(160.0)),
-            text(format!("{gain_db:+.1} dB")).width(Length::Fixed(70.0)),
+                .width(Length::Fixed(140.0)),
+            text(format!("{gain_db:+.1} dB")).width(Length::Fixed(60.0)),
             text(lufs_str).size(11).width(Length::Fixed(80.0)),
+            text(delta_str).size(11).width(Length::Fixed(80.0)),
         ]
-        .spacing(10)
+        .spacing(8)
         .align_y(Alignment::Center)
         .into()
     }
@@ -828,9 +900,9 @@ impl State {
 }
 
 /// A simple meter bar (dB → 0..1 fill over the -60..0 dB range).
-fn meter_bar(peak_db: f32) -> Element<'static, Message> {
+fn meter_bar(peak_db: f32, width: f32) -> Element<'static, Message> {
     progress_bar(METER_FLOOR_DB..=0.0, peak_db.clamp(METER_FLOOR_DB, 0.0))
-        .width(Length::Fixed(220.0))
+        .width(Length::Fixed(width))
         .height(Length::Fixed(16.0))
         .into()
 }
@@ -985,16 +1057,18 @@ impl canvas::Program<Message> for Lane {
         let (w, h) = (bounds.width, bounds.height);
         let mid = h / 2.0;
 
-        // Lane background + centerline.
+        // Lane background + a single horizontal separator at the bottom
+        // (between this lane and the next) — no centerline through the
+        // waveform.
         frame.fill_rectangle(
             Point::new(0.0, 0.0),
             bounds.size(),
             Color::from_rgb(0.10, 0.11, 0.13),
         );
         frame.fill_rectangle(
-            Point::new(0.0, mid - 0.5),
+            Point::new(0.0, h - 1.0),
             Size::new(w, 1.0),
-            Color::from_rgb(0.25, 0.26, 0.30),
+            Color::from_rgb(0.22, 0.23, 0.27),
         );
 
         // Bar/unit grid. Faint verticals across the lane at the current zoom.

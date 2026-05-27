@@ -137,7 +137,13 @@ pub struct RecorderControl {
     tx: Sender<WriterCommand>,
     pub state: Arc<RecordState>,
     pub recording: bool,
+    /// Root of the current/last session folder
+    /// (`~/Music/Gatherer/<session_name>/`). Recording WAVs land in
+    /// `<root>/recording/`; export writes `<root>/unnormalized/` and
+    /// `<root>/normalized/`.
     pub last_session: Option<PathBuf>,
+    /// Resolved session name (whatever the user typed, or auto-generated).
+    pub last_session_name: Option<String>,
     /// Source indices captured in the last/current session (for loading the
     /// take back for playback + waveform display).
     pub last_armed: Vec<usize>,
@@ -153,21 +159,22 @@ impl RecorderControl {
             state,
             recording: false,
             last_session: None,
+            last_session_name: None,
             last_armed: Vec::new(),
             last_preview: None,
             error: None,
         }
     }
 
-    pub fn toggle(&mut self, sample_rate: u32) {
+    pub fn toggle(&mut self, sample_rate: u32, session_name: &str) {
         if self.recording {
             self.stop();
         } else {
-            self.start(sample_rate);
+            self.start(sample_rate, session_name);
         }
     }
 
-    fn start(&mut self, sample_rate: u32) {
+    fn start(&mut self, sample_rate: u32, session_name: &str) {
         let armed: Vec<usize> = (0..self.state.num_sources())
             .filter(|&s| self.state.is_armed(s))
             .collect();
@@ -175,13 +182,24 @@ impl RecorderControl {
             self.error = Some("Arm at least one source (R) before recording".into());
             return;
         }
-        let dir = match session_dir() {
-            Ok(d) => d,
+        // Resolve the session name (auto-fill with a timestamp if blank).
+        let resolved_name = if session_name.trim().is_empty() {
+            format!("session-{}", unix_secs())
+        } else {
+            session_name.trim().to_string()
+        };
+        let session_root = match session_root_for(&resolved_name) {
+            Ok(p) => p,
             Err(e) => {
                 self.error = Some(e);
                 return;
             }
         };
+        let recording_dir = session_root.join("recording");
+        if let Err(e) = std::fs::create_dir_all(&recording_dir) {
+            self.error = Some(format!("create {}: {e}", recording_dir.display()));
+            return;
+        }
         self.last_armed = armed.clone();
         let preview = RecordingPreview::new(&armed, sample_rate);
         self.last_preview = Some(preview.clone());
@@ -189,7 +207,7 @@ impl RecorderControl {
         if self
             .tx
             .send(WriterCommand::Start {
-                dir: dir.clone(),
+                dir: recording_dir,
                 armed,
                 sample_rate,
                 preview,
@@ -201,7 +219,8 @@ impl RecorderControl {
             return;
         }
         self.recording = true;
-        self.last_session = Some(dir);
+        self.last_session = Some(session_root);
+        self.last_session_name = Some(resolved_name);
         self.error = None;
     }
 
@@ -332,21 +351,22 @@ fn finalize(writers: &mut [Option<Wav>]) {
     }
 }
 
-/// `~/Music/Gatherer Recordings/session-<unix-secs>/`, created.
-fn session_dir() -> Result<PathBuf, String> {
+/// `~/Music/Gatherer/<name>/`, created. Single root for the whole session
+/// (recording, unnormalized export, normalized export sit underneath).
+fn session_root_for(name: &str) -> Result<PathBuf, String> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| "HOME not set".to_string())?;
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let dir = home
-        .join("Music")
-        .join("Gatherer Recordings")
-        .join(format!("session-{secs}"));
+    let dir = home.join("Music").join("Gatherer").join(name);
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     Ok(dir)
+}
+
+fn unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

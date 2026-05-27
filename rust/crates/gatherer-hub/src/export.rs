@@ -6,7 +6,6 @@ use crate::playback::PlaybackData;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct ExportResult {
     pub dir: PathBuf,
@@ -14,33 +13,25 @@ pub struct ExportResult {
     pub source_count: usize,
 }
 
-/// Write `original/` and `normalized/` subfolders under
-/// `~/Music/Gatherer Exports/session-<ts>/`.
+/// Write `unnormalized/` and `normalized/` subfolders under the session
+/// root (sibling of `recording/`). Filenames come from `layer_names[src_idx]`
+/// when non-empty (sanitized for the filesystem), else `source-NN.wav`.
 ///
 /// `source_indices` is parallel to `data.sources` — `data.sources[i]` is
 /// the audio for `source_indices[i]` (the user-side slot index).
 pub fn export_stems(
     data: &PlaybackData,
     sample_rate: u32,
+    session_root: &Path,
     source_indices: &[usize],
+    layer_names: &[String],
     measurements: &HashMap<usize, LufsMeasurement>,
     target_lufs: f64,
 ) -> Result<ExportResult, String> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| "HOME not set".to_string())?;
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let root = home
-        .join("Music")
-        .join("Gatherer Exports")
-        .join(format!("session-{ts}"));
-    let orig_dir = root.join("original");
-    let norm_dir = root.join("normalized");
-    std::fs::create_dir_all(&orig_dir)
-        .map_err(|e| format!("create {}: {e}", orig_dir.display()))?;
+    let unnorm_dir = session_root.join("unnormalized");
+    let norm_dir = session_root.join("normalized");
+    std::fs::create_dir_all(&unnorm_dir)
+        .map_err(|e| format!("create {}: {e}", unnorm_dir.display()))?;
     std::fs::create_dir_all(&norm_dir)
         .map_err(|e| format!("create {}: {e}", norm_dir.display()))?;
 
@@ -56,22 +47,49 @@ pub fn export_stems(
         let Some(samples) = data.sources.get(i) else {
             continue;
         };
-        let orig_path = orig_dir.join(format!("source-{:02}.wav", src_idx + 1));
-        write_wav(&orig_path, spec, samples, 1.0)?;
+        let name = layer_filename(layer_names, src_idx);
+        let unnorm_path = unnorm_dir.join(format!("{name}.wav"));
+        write_wav(&unnorm_path, spec, samples, 1.0)?;
 
         let gain = measurements
             .get(&src_idx)
             .map(|m| normalization_gain(m.integrated, target_lufs))
             .unwrap_or(1.0);
-        let norm_path = norm_dir.join(format!("source-{:02}.wav", src_idx + 1));
+        let norm_path = norm_dir.join(format!("{name}.wav"));
         write_wav(&norm_path, spec, samples, gain)?;
         written += 1;
     }
 
     Ok(ExportResult {
-        dir: root,
+        dir: session_root.to_path_buf(),
         source_count: written,
     })
+}
+
+fn layer_filename(layer_names: &[String], src_idx: usize) -> String {
+    let raw = layer_names
+        .get(src_idx)
+        .map(|s| s.trim())
+        .unwrap_or("");
+    if raw.is_empty() {
+        format!("source-{:02}", src_idx + 1)
+    } else {
+        sanitize(raw)
+    }
+}
+
+/// Conservative filesystem-safe name: keep alphanumerics, space, dash,
+/// underscore, dot; collapse everything else to `_`.
+fn sanitize(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn write_wav(
@@ -124,18 +142,43 @@ mod tests {
             time_sig_num: 4,
         };
 
-        // Override $HOME for the test so we don't litter the user's Music/.
-        let home = std::env::temp_dir().join(format!("gatherer-export-test-{}", std::process::id()));
-        std::fs::create_dir_all(&home).unwrap();
-        std::env::set_var("HOME", &home);
+        let session_root = std::env::temp_dir()
+            .join(format!("gatherer-export-test-{}", std::process::id()));
+        std::fs::create_dir_all(&session_root).unwrap();
 
-        let result = export_stems(&data, sr, &[0], &meas_map, -14.0).unwrap();
-        let orig = result.dir.join("original").join("source-01.wav");
-        let norm = result.dir.join("normalized").join("source-01.wav");
-        assert!(orig.exists());
+        // Named layer "Vocals" + an unnamed slot to exercise the fallback.
+        let layer_names = vec!["Vocals".to_string()];
+        let result = export_stems(
+            &data,
+            sr,
+            &session_root,
+            &[0],
+            &layer_names,
+            &meas_map,
+            -14.0,
+        )
+        .unwrap();
+        let unnorm = result.dir.join("unnormalized").join("Vocals.wav");
+        let norm = result.dir.join("normalized").join("Vocals.wav");
+        assert!(unnorm.exists());
         assert!(norm.exists());
         assert_eq!(result.source_count, 1);
 
-        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&session_root);
+    }
+
+    #[test]
+    fn sanitize_drops_unsafe_chars() {
+        assert_eq!(sanitize("Vocals"), "Vocals");
+        assert_eq!(sanitize("Vocals/Lead"), "Vocals_Lead");
+        assert_eq!(sanitize("kick: 1"), "kick_ 1"); // space is allowed
+        assert_eq!(sanitize("a*b?c"), "a_b_c");
+    }
+
+    #[test]
+    fn layer_filename_falls_back_when_blank() {
+        assert_eq!(layer_filename(&[], 3), "source-04");
+        assert_eq!(layer_filename(&["   ".to_string()], 0), "source-01");
+        assert_eq!(layer_filename(&["Bass".to_string()], 0), "Bass");
     }
 }
