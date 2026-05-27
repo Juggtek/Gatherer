@@ -21,8 +21,8 @@ fn main() -> iced::Result {
         .subscription(State::subscription)
         .antialiasing(true)
         .window(iced::window::Settings {
-            size: iced::Size::new(900.0, 600.0),
-            min_size: Some(iced::Size::new(600.0, 400.0)),
+            size: iced::Size::new(1500.0, 980.0),
+            min_size: Some(iced::Size::new(900.0, 600.0)),
             ..Default::default()
         })
         .run_with(|| (State::new(), iced::Task::none()))

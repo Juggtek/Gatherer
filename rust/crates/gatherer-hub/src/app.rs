@@ -16,14 +16,22 @@ use iced::widget::{
     Space,
 };
 use iced::{
-    mouse, Alignment, Color, Element, Length, Point, Rectangle, Renderer, Size, Subscription,
-    Task, Theme,
+    alignment, mouse, Alignment, Color, Element, Length, Pixels, Point, Rectangle, Renderer, Size,
+    Subscription, Task, Theme,
 };
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// Timeline geometry constants.
+const PIXELS_PER_UNIT: f32 = 100.0; // 1 bar (or 1 s without MIDI sync) = this many px
+const LANE_HEIGHT: f32 = 56.0;
+const RULER_HEIGHT: f32 = 22.0;
+const TIMELINE_LABEL_WIDTH: f32 = 64.0;
+const MIN_UNITS_VISIBLE: f32 = 16.0;
+const TIMELINE_PADDING_UNITS: f32 = 2.0;
 
 /// UI meter tick — matches FIELD's ~30 Hz diagnostics cadence.
 const TICK_MS: u64 = 33;
@@ -368,64 +376,117 @@ impl State {
             );
         }
 
-        // Per-source mixer rows, then the recorded-take waveforms.
-        let mut rows = column![].spacing(6);
+        // Per-source mixer rows (stacked directly; the window is large enough).
+        body = body.push(Space::with_height(8));
+        body = body.push(text("Sources").size(14));
         for i in 0..self.num_sources {
-            rows = rows.push(self.source_row(i));
+            body = body.push(self.source_row(i));
         }
+
+        // Bar-based timeline (scrollable horizontally; takes positioned at
+        // their actual bar offset on the DAW's grid).
         if self.num_sources > 0 {
-            rows = rows.push(Space::with_height(8));
-            rows = rows.push(text("Recorded take").size(14));
-
-            let recording = self.recorder.as_ref().map(|r| r.recording).unwrap_or(false);
-            let preview = self.recorder.as_ref().and_then(|r| r.last_preview.as_ref());
-
-            // Lane time-extent + grid info.
-            let (len_seconds, take_pulses, take_bpm) = if recording {
-                let elapsed = preview
-                    .map(|p| {
-                        p.sources
-                            .iter()
-                            .map(|s| {
-                                let n = s.current_bucket.load(Ordering::Relaxed);
-                                n as f32 * (p.samples_per_bucket as f32 / 2.0)
-                                    / p.sample_rate as f32
-                            })
-                            .fold(0.0f32, f32::max)
-                    })
-                    .unwrap_or(0.0);
-                let bpm = self.midi.as_ref().map(|m| m.state.bpm()).unwrap_or(0.0);
-                (elapsed, self.take_start_pulses, bpm)
-            } else if self.playback.has_take() {
-                let sr = self.engine.as_ref().map(|e| e.sample_rate).unwrap_or(48_000.0);
-                self.playback
-                    .snapshot()
-                    .map(|d| (d.len_frames as f32 / sr, d.start_pulses, d.bpm))
-                    .unwrap_or((0.0, 0, 0.0))
-            } else {
-                (0.0, 0, 0.0)
-            };
-
-            let bar_lines = bar_fractions(take_pulses, take_bpm, len_seconds);
-            let playhead = if !recording && self.playback.has_take() {
-                Some(self.playback.fraction())
-            } else {
-                None
-            };
-
-            for i in 0..self.num_sources {
-                let env: Vec<f32> = if recording {
-                    preview.map(|p| p.snapshot(i)).unwrap_or_default()
-                } else {
-                    self.waveforms.get(&i).cloned().unwrap_or_default()
-                };
-                rows = rows.push(text(format!("Src {}", i + 1)).size(11));
-                rows = rows.push(waveform_lane(env, playhead, bar_lines.clone()));
-            }
+            body = body.push(Space::with_height(10));
+            body = body.push(text("Timeline").size(14));
+            body = body.push(self.timeline_section());
         }
-        body = body.push(scrollable(rows).height(Length::Fill));
 
-        container(body).padding(20).width(Length::Fill).height(Length::Fill).into()
+        container(body).padding(16).width(Length::Fill).height(Length::Fill).into()
+    }
+
+    fn timeline_section(&self) -> Element<'_, Message> {
+        let recording = self.recorder.as_ref().map(|r| r.recording).unwrap_or(false);
+        let preview = self.recorder.as_ref().and_then(|r| r.last_preview.as_ref());
+        let sr = self.engine.as_ref().map(|e| e.sample_rate).unwrap_or(48_000.0);
+
+        // Active grid context: recording snapshot, or loaded take, else nothing.
+        let (bpm, start_pulses, take_len_seconds) = if recording {
+            let elapsed = preview
+                .map(|p| {
+                    p.sources
+                        .iter()
+                        .map(|s| {
+                            let n = s.current_bucket.load(Ordering::Relaxed);
+                            n as f32 * (p.samples_per_bucket as f32 / 2.0)
+                                / p.sample_rate as f32
+                        })
+                        .fold(0.0f32, f32::max)
+                })
+                .unwrap_or(0.0);
+            (self.take_start_bpm, self.take_start_pulses, elapsed)
+        } else if self.playback.has_take() {
+            self.playback
+                .snapshot()
+                .map(|d| (d.bpm, d.start_pulses, d.len_frames as f32 / sr))
+                .unwrap_or((0.0, 0, 0.0))
+        } else {
+            (0.0, 0, 0.0)
+        };
+
+        // Unit = one bar when MIDI sync is up, else one second (graceful fallback).
+        let unit_seconds = if bpm > 0.0 {
+            60.0 / bpm * BEATS_PER_BAR as f32
+        } else {
+            1.0
+        };
+        let take_start_units = if bpm > 0.0 {
+            start_pulses as f32 / (PPQN * BEATS_PER_BAR) as f32
+        } else {
+            0.0
+        };
+        let take_len_units = take_len_seconds / unit_seconds;
+        let total_units = (take_start_units + take_len_units + TIMELINE_PADDING_UNITS)
+            .max(MIN_UNITS_VISIBLE);
+        let total_pixels = total_units * PIXELS_PER_UNIT;
+        let take_start_x = take_start_units * PIXELS_PER_UNIT;
+        let take_end_x = (take_start_units + take_len_units) * PIXELS_PER_UNIT;
+        let unit_label = if bpm > 0.0 { "bar" } else { "s" };
+
+        let playhead_x = if !recording && self.playback.has_take() {
+            let pos_s = self.playback.position() as f32 / sr;
+            let units = take_start_units + pos_s / unit_seconds;
+            Some(units * PIXELS_PER_UNIT)
+        } else {
+            None
+        };
+
+        // Left labels column: blank ruler-height spacer, then "Src N" per lane.
+        let mut labels = column![].push(Space::with_height(Length::Fixed(RULER_HEIGHT)));
+        for i in 0..self.num_sources {
+            labels = labels.push(
+                container(text(format!("Src {}", i + 1)).size(11))
+                    .height(Length::Fixed(LANE_HEIGHT))
+                    .padding([0, 6])
+                    .align_y(alignment::Vertical::Center),
+            );
+        }
+
+        // Horizontally-scrollable content: ruler on top, one lane per source.
+        let mut timeline_col = column![].push(ruler_view(total_pixels, unit_label));
+        for i in 0..self.num_sources {
+            let env: Vec<f32> = if recording {
+                preview.map(|p| p.snapshot(i)).unwrap_or_default()
+            } else {
+                self.waveforms.get(&i).cloned().unwrap_or_default()
+            };
+            let (sx, ex) = if env.is_empty() {
+                (0.0, 0.0)
+            } else {
+                (take_start_x, take_end_x)
+            };
+            timeline_col = timeline_col.push(lane_view(total_pixels, env, sx, ex, playhead_x));
+        }
+
+        row![
+            labels.width(Length::Fixed(TIMELINE_LABEL_WIDTH)),
+            scrollable(timeline_col)
+                .direction(scrollable::Direction::Horizontal(
+                    scrollable::Scrollbar::default(),
+                ))
+                .width(Length::Fill),
+        ]
+        .spacing(0)
+        .into()
     }
 
     fn source_row(&self, i: usize) -> Element<'_, Message> {
@@ -531,16 +592,17 @@ fn midi_status_line(midi: Option<&MidiSync>) -> String {
     format!("MIDI {xport}  {bpm_str}   bar {bar} : beat {beat}")
 }
 
-/// A recorded source's waveform: peak envelope + optional playhead +
-/// bar-grid verticals (positions are 0..1 fractions of the lane width).
-/// Owns its data so the iced `Element` doesn't borrow from `State`.
-struct Waveform {
+/// One lane in the bar-based timeline. Coords are pixels; the take is
+/// rendered between `take_start_x` and `take_end_x` (empty range = no
+/// take). Owned data so the iced `Element` is `'static`.
+struct Lane {
     env: Vec<f32>,
-    playhead: Option<f32>,
-    bar_lines: Vec<f32>,
+    take_start_x: f32,
+    take_end_x: f32,
+    playhead_x: Option<f32>,
 }
 
-impl canvas::Program<Message> for Waveform {
+impl canvas::Program<Message> for Lane {
     type State = ();
 
     fn draw(
@@ -555,7 +617,7 @@ impl canvas::Program<Message> for Waveform {
         let (w, h) = (bounds.width, bounds.height);
         let mid = h / 2.0;
 
-        // Lane background + centerline so the waveform area is always visible.
+        // Lane background + centerline.
         frame.fill_rectangle(
             Point::new(0.0, 0.0),
             bounds.size(),
@@ -567,117 +629,127 @@ impl canvas::Program<Message> for Waveform {
             Color::from_rgb(0.25, 0.26, 0.30),
         );
 
-        // Bar grid lines (faint vertical strokes).
-        let grid_color = Color::from_rgb(0.40, 0.40, 0.46);
-        for &frac in &self.bar_lines {
-            let x = frac.clamp(0.0, 1.0) * w;
+        // Bar grid (every PIXELS_PER_UNIT). Faint verticals across the lane.
+        let grid_color = Color::from_rgb(0.30, 0.30, 0.36);
+        let mut x = 0.0;
+        while x <= w {
             frame.stroke(
                 &canvas::Path::line(Point::new(x, 0.0), Point::new(x, h)),
                 canvas::Stroke::default().with_color(grid_color).with_width(1.0),
             );
+            x += PIXELS_PER_UNIT;
         }
 
-        // Waveform bars (normalized to the take's loudest peak so quiet
-        // recordings still fill the lane).
+        // Waveform (normalized per take so quiet recordings still fill the lane).
         let n = self.env.len();
-        if n > 0 {
-            let col_w = (w / n as f32).max(1.0);
+        if n > 0 && self.take_end_x > self.take_start_x {
+            let take_w = self.take_end_x - self.take_start_x;
+            let col_w = (take_w / n as f32).max(1.0);
             let max = self.env.iter().cloned().fold(1e-6_f32, f32::max);
             let wave = Color::from_rgb(0.45, 0.72, 1.0);
             for (i, &amp) in self.env.iter().enumerate() {
                 let half = (amp / max).clamp(0.0, 1.0) * mid;
-                let x = i as f32 / n as f32 * w;
+                let xp = self.take_start_x + i as f32 / n as f32 * take_w;
                 let bar_h = (half * 2.0).max(1.0);
-                frame.fill_rectangle(Point::new(x, mid - half), Size::new(col_w, bar_h), wave);
+                frame.fill_rectangle(Point::new(xp, mid - half), Size::new(col_w, bar_h), wave);
             }
         }
 
         // Playhead (only while a loaded take is being played).
-        if let Some(p) = self.playhead {
-            let px = p.clamp(0.0, 1.0) * w;
-            frame.stroke(
-                &canvas::Path::line(Point::new(px, 0.0), Point::new(px, h)),
-                canvas::Stroke::default()
-                    .with_color(Color::from_rgb(1.0, 0.85, 0.3))
-                    .with_width(1.5),
-            );
+        if let Some(px) = self.playhead_x {
+            if px >= 0.0 && px <= w {
+                frame.stroke(
+                    &canvas::Path::line(Point::new(px, 0.0), Point::new(px, h)),
+                    canvas::Stroke::default()
+                        .with_color(Color::from_rgb(1.0, 0.85, 0.3))
+                        .with_width(1.5),
+                );
+            }
         }
 
         vec![frame.into_geometry()]
     }
 }
 
-fn waveform_lane(
+fn lane_view(
+    total_pixels: f32,
     env: Vec<f32>,
-    playhead: Option<f32>,
-    bar_lines: Vec<f32>,
+    take_start_x: f32,
+    take_end_x: f32,
+    playhead_x: Option<f32>,
 ) -> Element<'static, Message> {
-    canvas(Waveform {
+    canvas(Lane {
         env,
-        playhead,
-        bar_lines,
+        take_start_x,
+        take_end_x,
+        playhead_x,
     })
-    .width(Length::Fill)
-    .height(Length::Fixed(56.0))
+    .width(Length::Fixed(total_pixels))
+    .height(Length::Fixed(LANE_HEIGHT))
     .into()
 }
 
-/// Positions (0..1 fractions of `len_seconds`) where bar boundaries fall
-/// for a take that started at MIDI pulse `start_pulses` at `bpm`. Empty
-/// when MIDI sync isn't running (bpm == 0) or the lane has no duration.
-fn bar_fractions(start_pulses: u64, bpm: f32, len_seconds: f32) -> Vec<f32> {
-    if bpm <= 0.0 || len_seconds <= 0.0 {
-        return Vec::new();
-    }
-    let bar_seconds = 60.0 / bpm * BEATS_PER_BAR as f32;
-    let pulses_per_bar = (PPQN * BEATS_PER_BAR) as u64;
-    let phase_pulses = start_pulses % pulses_per_bar;
-    let phase_seconds = phase_pulses as f32 / PPQN as f32 * (60.0 / bpm);
-    let first = if phase_seconds > 1e-3 {
-        bar_seconds - phase_seconds
-    } else {
-        0.0
-    };
-    let mut out = Vec::new();
-    let mut t = first;
-    while t < len_seconds {
-        if t >= 0.0 {
-            out.push(t / len_seconds);
-        }
-        t += bar_seconds;
-    }
-    out
+/// Top-of-timeline ruler: tick + numeric label at every grid unit.
+/// `unit_label` is "bar" (1-based labels) or "s" (0-based seconds).
+struct Ruler {
+    unit_label: &'static str,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+impl canvas::Program<Message> for Ruler {
+    type State = ();
 
-    #[test]
-    fn bar_fractions_120bpm_aligned() {
-        // 4/4 at 120 BPM → bar_seconds = 2.0 → bars at 0,2,4,6 over 8 s.
-        let f = bar_fractions(0, 120.0, 8.0);
-        assert_eq!(f.len(), 4);
-        assert!((f[0] - 0.0).abs() < 1e-6);
-        assert!((f[1] - 0.25).abs() < 1e-6);
-        assert!((f[2] - 0.50).abs() < 1e-6);
-        assert!((f[3] - 0.75).abs() < 1e-6);
-    }
+    fn draw(
+        &self,
+        _state: &(),
+        renderer: &Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        let mut frame = canvas::Frame::new(renderer, bounds.size());
+        let (w, h) = (bounds.width, bounds.height);
 
-    #[test]
-    fn bar_fractions_120bpm_midbar_start() {
-        // Started 2 beats into a 4/4 bar (48 pulses) → first bar line at 1 s.
-        let f = bar_fractions(48, 120.0, 8.0);
-        assert_eq!(f.len(), 4);
-        assert!((f[0] - 0.125).abs() < 1e-6);
-        assert!((f[1] - 0.375).abs() < 1e-6);
-        assert!((f[2] - 0.625).abs() < 1e-6);
-        assert!((f[3] - 0.875).abs() < 1e-6);
-    }
+        frame.fill_rectangle(
+            Point::new(0.0, 0.0),
+            bounds.size(),
+            Color::from_rgb(0.13, 0.14, 0.16),
+        );
+        frame.fill_rectangle(
+            Point::new(0.0, h - 1.0),
+            Size::new(w, 1.0),
+            Color::from_rgb(0.30, 0.30, 0.34),
+        );
 
-    #[test]
-    fn bar_fractions_empty_without_sync_or_length() {
-        assert!(bar_fractions(0, 0.0, 8.0).is_empty());
-        assert!(bar_fractions(0, 120.0, 0.0).is_empty());
+        let tick_color = Color::from_rgb(0.45, 0.45, 0.50);
+        let text_color = Color::from_rgb(0.85, 0.87, 0.90);
+        let mut u: u32 = 0;
+        loop {
+            let x = u as f32 * PIXELS_PER_UNIT;
+            if x > w {
+                break;
+            }
+            frame.fill_rectangle(Point::new(x, h - 6.0), Size::new(1.0, 6.0), tick_color);
+            let n = if self.unit_label == "bar" { u + 1 } else { u };
+            let label = canvas::Text {
+                content: format!("{n}"),
+                position: Point::new(x + 3.0, 2.0),
+                color: text_color,
+                size: Pixels(11.0),
+                horizontal_alignment: alignment::Horizontal::Left,
+                vertical_alignment: alignment::Vertical::Top,
+                ..Default::default()
+            };
+            frame.fill_text(label);
+            u += 1;
+        }
+
+        vec![frame.into_geometry()]
     }
+}
+
+fn ruler_view(total_pixels: f32, unit_label: &'static str) -> Element<'static, Message> {
+    canvas(Ruler { unit_label })
+        .width(Length::Fixed(total_pixels))
+        .height(Length::Fixed(RULER_HEIGHT))
+        .into()
 }

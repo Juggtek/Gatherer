@@ -89,6 +89,7 @@ impl Playback {
         self.len_frames.load(Ordering::Relaxed)
     }
     /// Playhead position as a 0..1 fraction of the take length.
+    #[allow(dead_code)] // superseded by the timeline's pixel-based playhead
     pub fn fraction(&self) -> f32 {
         let len = self.len_frames();
         if len == 0 {
