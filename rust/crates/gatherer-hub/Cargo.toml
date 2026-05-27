@@ -1,0 +1,23 @@
+[package]
+name = "gatherer-hub"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Gatherer Hub — standalone iced+cpal mixer that gathers DAW-routed audio"
+
+[[bin]]
+name = "gatherer-hub"
+path = "src/main.rs"
+
+[dependencies]
+# Versions pinned to match FIELD (/Users/felix/Documents/Coding/FIELD) so its
+# audio/iced/widget patterns transfer cleanly.
+iced = { version = "0.13", features = ["tokio", "canvas", "advanced"] }
+cpal = "0.15"
+atomic_float = "1"
+# Lock-free SPSC ring to bridge the input (capture) and output (monitor) streams,
+# and to feed the recording writer thread.
+rtrb = "0.3"
+# WAV writing for per-source recording (background writer thread).
+hound = "3"

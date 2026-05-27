@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["crates/gatherer-hub"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Felix Niedermair <niedermairfelix@gmail.com>"]
+rust-version = "1.75"
+
+# Audio DSP is unusably slow at the default dev opt-level=0 (mirrors FIELD).
+[profile.dev]
+opt-level = 1
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
