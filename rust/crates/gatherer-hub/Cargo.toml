@@ -26,3 +26,5 @@ arc-swap = "1"
 # MIDI input (Clock/transport sync from the DAW). Virtual input port on
 # macOS/Linux; the hub appears as a MIDI destination called "Gatherer Hub".
 midir = "0.10"
+# LUFS loudness measurement (BS.1770) for per-source normalization on export.
+ebur128 = "0.1"

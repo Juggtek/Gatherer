@@ -6,6 +6,7 @@
 //! widgets for now; FIELD's canvas meters/faders are a later polish pass.
 
 use crate::audio::{self, AudioEngine};
+use crate::measurement::{self, LufsMeasurement};
 use crate::midi::{self, MidiSync, PPQN};
 use crate::params::{linear_to_db, HubParams, GAIN_DB_MAX, GAIN_DB_MIN};
 use crate::playback::Playback;
@@ -20,6 +21,7 @@ use iced::{
     Subscription, Task, Theme,
 };
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -64,6 +66,8 @@ pub enum Message {
     SetTakeOffsetUnits(f32),
     CommitTakeOffset,
     ToggleSnap(bool),
+    SetTargetLufs(f32),
+    ExportStems,
     Tick,
 }
 
@@ -108,6 +112,15 @@ pub struct State {
     /// If true, dragged clips snap to the nearest bar on release. Toggle
     /// off for free positioning.
     snap_to_grid: bool,
+
+    /// Normalization target (LUFS, integrated). -14 is the streaming default.
+    target_lufs: f32,
+    /// Per-source LUFS measurement of the loaded take.
+    lufs_results: HashMap<usize, LufsMeasurement>,
+    /// Path of the most recent stems export (for the status line).
+    last_export_dir: Option<PathBuf>,
+    /// Last export error, if any.
+    export_error: Option<String>,
 }
 
 impl State {
@@ -144,6 +157,10 @@ impl State {
             time_sig_num: 4,
             take_user_offset_units: 0.0,
             snap_to_grid: true,
+            target_lufs: -14.0,
+            lufs_results: HashMap::new(),
+            last_export_dir: None,
+            export_error: None,
         };
         state.restart_engine();
         state
@@ -294,6 +311,10 @@ impl State {
             Message::ToggleSnap(on) => {
                 self.snap_to_grid = on;
             }
+            Message::SetTargetLufs(lufs) => {
+                self.target_lufs = lufs.clamp(-40.0, 0.0);
+            }
+            Message::ExportStems => self.do_export_stems(),
             Message::Tick => {
                 self.refresh_meters();
                 if let Some(t) = self.pending_load_at {
@@ -342,11 +363,60 @@ impl State {
             self.take_start_time_sig,
         ) {
             Ok((data, envs)) => {
+                // Per-source LUFS measurement (integrated + max short-term +
+                // max momentary). Synchronous; takes ~100ms per minute of audio.
+                let sr_u = self
+                    .engine
+                    .as_ref()
+                    .map(|e| e.sample_rate as u32)
+                    .unwrap_or(48_000);
+                let mut measurements = HashMap::new();
+                for (i, &src_idx) in armed.iter().enumerate() {
+                    if let Some(samples) = data.sources.get(i) {
+                        measurements
+                            .insert(src_idx, measurement::measure(samples, 2, sr_u));
+                    }
+                }
+                self.lufs_results = measurements;
                 self.playback.set_take(data);
                 self.waveforms = envs.into_iter().collect();
                 self.take_user_offset_units = 0.0;
+                self.last_export_dir = None;
+                self.export_error = None;
             }
             Err(e) => self.error = Some(format!("load take: {e}")),
+        }
+    }
+
+    /// Write per-source WAVs to `~/Music/Gatherer Exports/session-<ts>/`
+    /// in `original/` and `normalized/` flavors. Normalized uses each
+    /// source's integrated LUFS measurement to reach `target_lufs`.
+    fn do_export_stems(&mut self) {
+        self.export_error = None;
+        let Some(d) = self.playback.snapshot() else {
+            self.export_error = Some("no take loaded".into());
+            return;
+        };
+        let Some(rec) = self.recorder.as_ref() else {
+            return;
+        };
+        let sr = self
+            .engine
+            .as_ref()
+            .map(|e| e.sample_rate as u32)
+            .unwrap_or(48_000);
+        match crate::export::export_stems(
+            &d,
+            sr,
+            &rec.last_armed,
+            &self.lufs_results,
+            self.target_lufs as f64,
+        ) {
+            Ok(result) => {
+                self.last_export_dir = Some(result.dir);
+                self.export_error = None;
+            }
+            Err(e) => self.export_error = Some(e),
         }
     }
 
@@ -446,6 +516,61 @@ impl State {
         .spacing(8)
         .align_y(Alignment::Center);
 
+        // ---- LEFT (extension): Normalize & Export + per-source LUFS detail. ----
+        let target_row = row![
+            text("Target").width(Length::Fixed(60.0)),
+            slider(-30.0..=0.0, self.target_lufs, Message::SetTargetLufs)
+                .step(0.5)
+                .width(Length::Fixed(220.0)),
+            text(format!("{:.1} LUFS", self.target_lufs)).width(Length::Fixed(90.0)),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+
+        let export_status: String = if let Some(p) = &self.last_export_dir {
+            format!("\u{2192} {}", p.display())
+        } else if let Some(e) = &self.export_error {
+            format!("error: {e}")
+        } else {
+            "writes original/ + normalized/ under ~/Music/Gatherer Exports/".into()
+        };
+
+        let export_row = row![
+            button(text("Export stems")).on_press(Message::ExportStems),
+            text(export_status).size(11),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+
+        let export_block = column![
+            text("Normalize & Export").size(14),
+            target_row,
+            export_row,
+        ]
+        .spacing(4);
+
+        let mut measurements_block = column![].spacing(2);
+        if !self.lufs_results.is_empty() {
+            measurements_block =
+                measurements_block.push(text("Measurements (max over take)").size(12));
+            for src in 0..self.num_sources {
+                if let Some(m) = self.lufs_results.get(&src) {
+                    let line = if m.integrated.is_finite() {
+                        format!(
+                            "Src {}:  I {:>6.1}   S {:>6.1}   M {:>6.1}",
+                            src + 1,
+                            m.integrated,
+                            m.max_short_term,
+                            m.max_momentary
+                        )
+                    } else {
+                        format!("Src {}:  \u{2014}", src + 1)
+                    };
+                    measurements_block = measurements_block.push(text(line).size(11));
+                }
+            }
+        }
+
         let mut left_col = column![]
             .spacing(8)
             .push(input_picker)
@@ -460,6 +585,9 @@ impl State {
             .push(meter_block)
             .push(zoom_block)
             .push(snap_block)
+            .push(Space::with_height(6))
+            .push(export_block)
+            .push(measurements_block)
             .width(Length::Fixed(580.0));
 
         // ---- RIGHT column: Sources + Record/Transport. ----
@@ -663,6 +791,19 @@ impl State {
             arm.on_toggle(move |b| Message::SetArm(i, b))
         };
 
+        // Integrated LUFS readout (per-source) — compact; '—' for silence/none.
+        let lufs_str = self
+            .lufs_results
+            .get(&i)
+            .map(|m| {
+                if m.integrated.is_finite() {
+                    format!("{:>6.1} LUFS", m.integrated)
+                } else {
+                    "  \u{2014}    LUFS".to_string()
+                }
+            })
+            .unwrap_or_default();
+
         row![
             text(format!("Src {}", i + 1)).size(14).width(Length::Fixed(70.0)),
             meter_bar(peak_db),
@@ -674,6 +815,7 @@ impl State {
                 .step(0.5)
                 .width(Length::Fixed(160.0)),
             text(format!("{gain_db:+.1} dB")).width(Length::Fixed(70.0)),
+            text(lufs_str).size(11).width(Length::Fixed(80.0)),
         ]
         .spacing(10)
         .align_y(Alignment::Center)
