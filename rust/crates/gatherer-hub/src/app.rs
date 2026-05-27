@@ -7,14 +7,20 @@
 
 use crate::audio::{self, AudioEngine};
 use crate::params::{linear_to_db, HubParams, GAIN_DB_MAX, GAIN_DB_MIN};
+use crate::playback::Playback;
 use crate::recording::{RecordState, RecorderControl};
 use cpal::traits::{DeviceTrait, HostTrait};
 use iced::widget::{
-    button, checkbox, column, container, progress_bar, row, scrollable, slider, text, Space,
+    button, canvas, checkbox, column, container, progress_bar, row, scrollable, slider, text,
+    Space,
 };
-use iced::{Alignment, Element, Length, Subscription, Task};
+use iced::{
+    mouse, Alignment, Color, Element, Length, Point, Rectangle, Renderer, Size, Subscription,
+    Task, Theme,
+};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// UI meter tick — matches FIELD's ~30 Hz diagnostics cadence.
 const TICK_MS: u64 = 33;
@@ -33,6 +39,9 @@ pub enum Message {
     SetMasterGainDb(f32),
     SetArm(usize, bool),
     ToggleRecord,
+    PlaybackPlay,
+    PlaybackPause,
+    PlaybackStop,
     Tick,
 }
 
@@ -45,6 +54,7 @@ pub struct State {
     params: HubParams,
     engine: Option<AudioEngine>,
     recorder: Option<RecorderControl>,
+    playback: Arc<Playback>,
     num_sources: usize,
     error: Option<String>,
 
@@ -52,6 +62,11 @@ pub struct State {
     source_peaks_db: Vec<f32>,
     master_peak_db: f32,
     master_gain_db: f32,
+    /// Per recorded source: (source index, peak envelope) for the waveform.
+    waveforms: Vec<(usize, Vec<f32>)>,
+    /// Set when recording stops; the take is loaded once the writer thread
+    /// has had time to finalize the WAV files.
+    pending_load_at: Option<Instant>,
 }
 
 impl State {
@@ -70,11 +85,14 @@ impl State {
             params: HubParams::new(0),
             engine: None,
             recorder: None,
+            playback: Playback::new(),
             num_sources: 0,
             error: None,
             source_peaks_db: Vec::new(),
             master_peak_db: METER_FLOOR_DB,
             master_gain_db: 0.0,
+            waveforms: Vec::new(),
+            pending_load_at: None,
         };
         state.restart_engine();
         state
@@ -98,6 +116,7 @@ impl State {
             self.params.clone(),
             record_state.clone(),
             rx,
+            self.playback.clone(),
             self.selected_input.as_deref(),
             self.selected_output.as_deref(),
         ) {
@@ -163,11 +182,30 @@ impl State {
             }
             Message::ToggleRecord => {
                 let sr = self.engine.as_ref().map(|e| e.sample_rate as u32).unwrap_or(48000);
-                if let Some(r) = self.recorder.as_mut() {
+                let stopped = if let Some(r) = self.recorder.as_mut() {
+                    let was = r.recording;
                     r.toggle(sr);
+                    was && !r.recording
+                } else {
+                    false
+                };
+                if stopped {
+                    // Load the take once the writer thread has finalized the WAVs.
+                    self.pending_load_at = Some(Instant::now());
                 }
             }
-            Message::Tick => self.refresh_meters(),
+            Message::PlaybackPlay => self.playback.play(),
+            Message::PlaybackPause => self.playback.pause(),
+            Message::PlaybackStop => self.playback.stop(),
+            Message::Tick => {
+                self.refresh_meters();
+                if let Some(t) = self.pending_load_at {
+                    if t.elapsed() > Duration::from_millis(400) {
+                        self.pending_load_at = None;
+                        self.load_take();
+                    }
+                }
+            }
         }
         Task::none()
     }
@@ -184,6 +222,28 @@ impl State {
             self.params.master_peak_r.swap(0.0, std::sync::atomic::Ordering::Relaxed),
         );
         self.master_peak_db = decay(self.master_peak_db, linear_to_db(ml.max(mr)));
+    }
+
+    /// Read the last recorded take's WAVs into the playback engine and build
+    /// the display envelopes. Called shortly after recording stops.
+    fn load_take(&mut self) {
+        let Some(r) = self.recorder.as_ref() else {
+            return;
+        };
+        let Some(dir) = r.last_session.clone() else {
+            return;
+        };
+        let armed = r.last_armed.clone();
+        if armed.is_empty() {
+            return;
+        }
+        match crate::playback::load_take(&dir, &armed) {
+            Ok((data, envs)) => {
+                self.playback.set_take(data);
+                self.waveforms = envs;
+            }
+            Err(e) => self.error = Some(format!("load take: {e}")),
+        }
     }
 
     pub fn view(&self) -> Element<'_, Message> {
@@ -257,10 +317,36 @@ impl State {
             .align_y(Alignment::Center),
         );
 
-        // Per-source rows.
+        // Playback transport (shown once a take is loaded).
+        if self.playback.has_take() {
+            let sr = self.engine.as_ref().map(|e| e.sample_rate).unwrap_or(48_000.0);
+            let pos_s = self.playback.position() as f32 / sr;
+            let len_s = self.playback.len_frames() as f32 / sr;
+            body = body.push(
+                row![
+                    button(text("\u{25B6} Play")).on_press(Message::PlaybackPlay),
+                    button(text("Pause")).on_press(Message::PlaybackPause),
+                    button(text("Stop")).on_press(Message::PlaybackStop),
+                    text(format!("{pos_s:.1}s / {len_s:.1}s")).size(13),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            );
+        }
+
+        // Per-source mixer rows, then the recorded-take waveforms.
         let mut rows = column![].spacing(6);
         for i in 0..self.num_sources {
             rows = rows.push(self.source_row(i));
+        }
+        if !self.waveforms.is_empty() {
+            rows = rows.push(Space::with_height(8));
+            rows = rows.push(text("Recorded take").size(14));
+            let frac = self.playback.fraction();
+            for (idx, env) in &self.waveforms {
+                rows = rows.push(text(format!("Src {}", idx + 1)).size(11));
+                rows = rows.push(waveform_lane(env, frac));
+            }
         }
         body = body.push(scrollable(rows).height(Length::Fill));
 
@@ -348,4 +434,69 @@ fn device_names(devices: Option<impl Iterator<Item = cpal::Device>>) -> Vec<Stri
     devices
         .map(|it| it.filter_map(|d| d.name().ok()).collect())
         .unwrap_or_default()
+}
+
+/// A recorded source's waveform: peak envelope (filled) + a playhead line.
+struct Waveform<'a> {
+    env: &'a [f32],
+    playhead: f32,
+}
+
+impl canvas::Program<Message> for Waveform<'_> {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &(),
+        renderer: &Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        let mut frame = canvas::Frame::new(renderer, bounds.size());
+        let (w, h) = (bounds.width, bounds.height);
+        let mid = h / 2.0;
+
+        // Lane background + centerline so the waveform area is always visible.
+        frame.fill_rectangle(
+            Point::new(0.0, 0.0),
+            bounds.size(),
+            Color::from_rgb(0.10, 0.11, 0.13),
+        );
+        frame.fill_rectangle(
+            Point::new(0.0, mid - 0.5),
+            Size::new(w, 1.0),
+            Color::from_rgb(0.25, 0.26, 0.30),
+        );
+
+        let n = self.env.len().max(1);
+        let col_w = (w / n as f32).max(1.0);
+        // Normalize to the take's loudest peak so quiet recordings still
+        // fill the lane (a display scaling, not a level readout).
+        let max = self.env.iter().cloned().fold(1e-6_f32, f32::max);
+        let wave = Color::from_rgb(0.45, 0.72, 1.0);
+        for (i, &amp) in self.env.iter().enumerate() {
+            let half = (amp / max).clamp(0.0, 1.0) * mid;
+            let x = i as f32 / n as f32 * w;
+            let bar_h = (half * 2.0).max(1.0); // keep a 1px sliver at silence
+            frame.fill_rectangle(Point::new(x, mid - half), Size::new(col_w, bar_h), wave);
+        }
+
+        let px = self.playhead.clamp(0.0, 1.0) * w;
+        frame.stroke(
+            &canvas::Path::line(Point::new(px, 0.0), Point::new(px, h)),
+            canvas::Stroke::default()
+                .with_color(Color::from_rgb(1.0, 0.85, 0.3))
+                .with_width(1.5),
+        );
+
+        vec![frame.into_geometry()]
+    }
+}
+
+fn waveform_lane(env: &[f32], playhead: f32) -> Element<'_, Message> {
+    canvas(Waveform { env, playhead })
+        .width(Length::Fill)
+        .height(Length::Fixed(56.0))
+        .into()
 }

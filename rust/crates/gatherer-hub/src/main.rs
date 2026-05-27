@@ -10,6 +10,7 @@
 mod app;
 mod audio;
 mod params;
+mod playback;
 mod recording;
 
 use app::State;

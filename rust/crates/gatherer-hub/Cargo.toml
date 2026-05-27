@@ -21,3 +21,5 @@ atomic_float = "1"
 rtrb = "0.3"
 # WAV writing for per-source recording (background writer thread).
 hound = "3"
+# Lock-free Arc swap — publish loaded playback buffers UI → audio thread.
+arc-swap = "1"

@@ -73,6 +73,9 @@ pub struct RecorderControl {
     pub state: Arc<RecordState>,
     pub recording: bool,
     pub last_session: Option<PathBuf>,
+    /// Source indices captured in the last/current session (for loading the
+    /// take back for playback + waveform display).
+    pub last_armed: Vec<usize>,
     pub error: Option<String>,
 }
 
@@ -83,6 +86,7 @@ impl RecorderControl {
             state,
             recording: false,
             last_session: None,
+            last_armed: Vec::new(),
             error: None,
         }
     }
@@ -110,6 +114,7 @@ impl RecorderControl {
                 return;
             }
         };
+        self.last_armed = armed.clone();
         self.state.set_active(true);
         if self
             .tx

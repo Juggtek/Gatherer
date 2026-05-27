@@ -10,6 +10,7 @@
 //! the input stream + ring bridge is net-new here.
 
 use crate::params::HubParams;
+use crate::playback::Playback;
 use crate::recording::{make_rings, writer_loop, RecordState, WriterCommand};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::sync::atomic::Ordering;
@@ -95,6 +96,7 @@ impl AudioEngine {
         params: HubParams,
         record_state: Arc<RecordState>,
         rec_cmd_rx: Receiver<WriterCommand>,
+        playback: Arc<Playback>,
         input_name: Option<&str>,
         output_name: Option<&str>,
     ) -> Result<Self, String> {
@@ -211,20 +213,53 @@ impl AudioEngine {
             )
             .map_err(|e| format!("build_input_stream: {e}"))?;
 
-        // ---- output (monitor) ----
+        // ---- output: play the recorded take when transport is running,
+        //      otherwise monitor the live gathered mix. ----
         let params_out = params.clone();
+        let playback_out = playback.clone();
         let output_stream = out_dev
             .build_output_stream(
                 &out_cfg,
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     let master = params_out.load_master_gain();
                     let frames = data.len() / out_ch.max(1);
+
+                    let take = if playback_out.is_playing() {
+                        playback_out.snapshot()
+                    } else {
+                        None
+                    };
+                    let mut pos = playback_out.position() as usize;
+                    let mut reached_end = false;
                     let mut mpk_l = 0f32;
                     let mut mpk_r = 0f32;
+
                     for f in 0..frames {
-                        // Underrun (input clock behind) → silence.
-                        let l = cons.pop().unwrap_or(0.0) * master;
-                        let r = cons.pop().unwrap_or(0.0) * master;
+                        let (mut l, mut r) = (0.0f32, 0.0f32);
+                        match &take {
+                            Some(d) => {
+                                if pos < d.len_frames {
+                                    let idx = pos * 2;
+                                    for src in &d.sources {
+                                        if idx + 1 < src.len() {
+                                            l += src[idx];
+                                            r += src[idx + 1];
+                                        }
+                                    }
+                                    pos += 1;
+                                } else {
+                                    reached_end = true;
+                                }
+                            }
+                            None => {
+                                // Underrun (input clock behind) → silence.
+                                l = cons.pop().unwrap_or(0.0);
+                                r = cons.pop().unwrap_or(0.0);
+                            }
+                        }
+                        l *= master;
+                        r *= master;
+
                         let base = f * out_ch;
                         if out_ch >= 1 {
                             data[base] = l;
@@ -237,6 +272,13 @@ impl AudioEngine {
                         }
                         mpk_l = mpk_l.max(l.abs());
                         mpk_r = mpk_r.max(r.abs());
+                    }
+
+                    if take.is_some() {
+                        playback_out.set_position(pos as u64);
+                        if reached_end {
+                            playback_out.pause(); // hold playhead at the end
+                        }
                     }
                     fmax_store(&params_out.master_peak_l, mpk_l);
                     fmax_store(&params_out.master_peak_r, mpk_r);
