@@ -15,6 +15,7 @@ mod midi;
 mod params;
 mod playback;
 mod recording;
+mod session;
 
 use app::State;
 

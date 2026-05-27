@@ -70,6 +70,8 @@ pub enum Message {
     ExportStems,
     SetSessionName(String),
     SetLayerName(usize, String),
+    SaveSession,
+    LoadSession(String),
     Tick,
 }
 
@@ -129,6 +131,8 @@ pub struct State {
     /// User-edited per-source layer names (used for export filenames; blank
     /// falls back to `source-NN`). Length tracks `num_sources`.
     layer_names: Vec<String>,
+    /// Last save/load result for the session status line.
+    session_status: Option<String>,
 }
 
 impl State {
@@ -171,6 +175,7 @@ impl State {
             export_error: None,
             session_name: String::new(),
             layer_names: Vec::new(),
+            session_status: None,
         };
         state.restart_engine();
         state
@@ -346,6 +351,8 @@ impl State {
                 }
                 self.layer_names[i] = name;
             }
+            Message::SaveSession => self.do_save_session(),
+            Message::LoadSession(name) => self.do_load_session(name),
             Message::Tick => {
                 self.refresh_meters();
                 if let Some(t) = self.pending_load_at {
@@ -424,6 +431,106 @@ impl State {
     /// Write per-source WAVs to `~/Music/Gatherer Exports/session-<ts>/`
     /// in `original/` and `normalized/` flavors. Normalized uses each
     /// source's integrated LUFS measurement to reach `target_lufs`.
+    fn do_save_session(&mut self) {
+        if self.session_name.trim().is_empty() {
+            self.session_status = Some("type a session name first".into());
+            return;
+        }
+        let session_root = match crate::session::ensure_root(&self.session_name) {
+            Ok(p) => p,
+            Err(e) => {
+                self.session_status = Some(e);
+                return;
+            }
+        };
+        let sr = self
+            .engine
+            .as_ref()
+            .map(|e| e.sample_rate as u32)
+            .unwrap_or(48_000);
+        let take = self.recorder.as_ref().and_then(|r| {
+            if r.last_armed.is_empty() {
+                None
+            } else {
+                Some(crate::session::TakeState {
+                    armed: r.last_armed.clone(),
+                    start_pulses: self.take_start_pulses,
+                    bpm: self.take_start_bpm,
+                    time_sig_num: self.take_start_time_sig,
+                    take_user_offset_units: self.take_user_offset_units,
+                })
+            }
+        });
+        let state = crate::session::SessionState {
+            session_name: self.session_name.clone(),
+            sample_rate: sr,
+            time_sig_num: self.time_sig_num,
+            target_lufs: self.target_lufs,
+            zoom: self.zoom,
+            snap_to_grid: self.snap_to_grid,
+            layer_names: self.layer_names.clone(),
+            take,
+        };
+        match crate::session::save(&session_root, &state) {
+            Ok(()) => {
+                self.session_status =
+                    Some(format!("saved \u{2192} {}", session_root.display()));
+            }
+            Err(e) => self.session_status = Some(format!("save error: {e}")),
+        }
+    }
+
+    fn do_load_session(&mut self, name: String) {
+        let Some(session_root) = crate::session::root_for(&name) else {
+            self.session_status = Some("HOME not set".into());
+            return;
+        };
+        let sess = match crate::session::load(&session_root) {
+            Ok(s) => s,
+            Err(e) => {
+                self.session_status = Some(format!("load error: {e}"));
+                return;
+            }
+        };
+
+        // Apply non-audio state.
+        self.session_name = sess.session_name.clone();
+        self.target_lufs = sess.target_lufs;
+        self.zoom = sess.zoom.clamp(0.15, 8.0);
+        self.snap_to_grid = sess.snap_to_grid;
+        self.time_sig_num = sess.time_sig_num.max(1);
+        let mut names = sess.layer_names;
+        names.resize(self.num_sources, String::new());
+        self.layer_names = names;
+
+        if let Some(take) = sess.take {
+            // Plant the recorder pointers so `load_take` reads from this
+            // session's `recording/` folder.
+            if let Some(rec) = self.recorder.as_mut() {
+                rec.last_session = Some(session_root.clone());
+                rec.last_session_name = Some(sess.session_name.clone());
+                rec.last_armed = take.armed.clone();
+            }
+            self.take_start_pulses = take.start_pulses;
+            self.take_start_bpm = take.bpm;
+            self.take_start_time_sig = take.time_sig_num;
+            self.take_user_offset_units = take.take_user_offset_units;
+            self.load_take();
+            self.session_status =
+                Some(format!("loaded \u{2192} {}", session_root.display()));
+        } else {
+            // No take in the saved session — clear playback + visuals.
+            self.playback.clear();
+            self.waveforms.clear();
+            self.lufs_results.clear();
+            self.take_user_offset_units = 0.0;
+            self.session_status = Some(format!(
+                "loaded (no take) \u{2192} {}",
+                session_root.display()
+            ));
+        }
+    }
+
     fn do_export_stems(&mut self) {
         self.export_error = None;
         let Some(d) = self.playback.snapshot() else {
@@ -623,7 +730,23 @@ impl State {
             text("Session").width(Length::Fixed(60.0)),
             text_input("session-<auto>", &self.session_name)
                 .on_input(Message::SetSessionName)
-                .width(Length::Fixed(360.0)),
+                .width(Length::Fixed(240.0)),
+            button(text("Save")).on_press(Message::SaveSession),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+
+        let sessions = crate::session::list_sessions();
+        let load_row = row![
+            Space::with_width(Length::Fixed(60.0)),
+            iced::widget::pick_list(
+                sessions,
+                Option::<String>::None,
+                Message::LoadSession,
+            )
+            .placeholder("Open existing session\u{2026}")
+            .width(Length::Fixed(240.0)),
+            text(self.session_status.as_deref().unwrap_or("")).size(11),
         ]
         .spacing(8)
         .align_y(Alignment::Center);
@@ -633,6 +756,7 @@ impl State {
             .push(input_picker)
             .push(output_picker)
             .push(session_row)
+            .push(load_row)
             .push(text(midi_status_line(self.midi.as_ref(), self.time_sig_num)).size(13));
         if let Some(err) = &self.error {
             left_col = left_col.push(text(format!("audio error: {err}")).size(13));

@@ -28,3 +28,6 @@ arc-swap = "1"
 midir = "0.10"
 # LUFS loudness measurement (BS.1770) for per-source normalization on export.
 ebur128 = "0.1"
+# Session save/load — TOML next to the session's audio folders.
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"

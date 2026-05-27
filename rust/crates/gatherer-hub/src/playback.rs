@@ -57,6 +57,15 @@ impl Playback {
     pub fn has_take(&self) -> bool {
         self.data.load().is_some()
     }
+
+    /// Drop the loaded take and reset transport (used when loading a saved
+    /// session that has no recorded audio).
+    pub fn clear(&self) {
+        self.playing.store(false, Ordering::Relaxed);
+        self.position.store(0, Ordering::Relaxed);
+        self.len_frames.store(0, Ordering::Relaxed);
+        self.data.store(None);
+    }
     /// Audio-thread snapshot of the current buffers (cheap Arc clone).
     pub fn snapshot(&self) -> Option<Arc<PlaybackData>> {
         self.data.load_full()
