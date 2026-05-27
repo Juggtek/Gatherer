@@ -63,12 +63,4 @@ private:
 
     std::vector<float>   scratch_;       // interleaved write scratch, sized in prepareToPlay
 
-    // PDC calibration: when hub sets the SHM `inject_spike` flag, sat sees
-    // it on its next processBlock. To avoid all live sats injecting their
-    // spike in the SAME block (which would superimpose them in hub's
-    // input and make per-slot identification impossible), each sat waits
-    // `slot_index` additional blocks before firing. So slot 0 injects
-    // immediately, slot 1 one block later, etc. Hub then knows exactly
-    // which block to look in for each sat's spike.
-    int                  cali_block_countdown_ = -1;  // -1 = idle
 };

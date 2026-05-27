@@ -36,12 +36,10 @@ public:
     void setMixState(bool mute, bool solo, bool record_arm,
                      float gain_db, float norm_db, float target_lufs);
 
-    // Per-track latency offset (PDC, measured by cross-correlation).
-    // Displayed as "Latency: 13.0 ms" with an editable field for manual
-    // override.
+    // Per-track latency override (manual entry). Displayed as
+    // "Latency: 13.0 ms (manual)" or "Latency: — (click to set)".
     static constexpr long long kPdcUnknown = std::numeric_limits<long long>::min();
-    void setPdcState(long long measured_samples, long long override_samples,
-                     double sample_rate, float confidence);
+    void setPdcState(long long override_samples, double sample_rate);
 
     // Bind the waveform thumbnail (owned elsewhere).
     void setThumbnail(juce::AudioThumbnail* thumbnail) { lane_.setThumbnail(thumbnail); }
@@ -72,9 +70,9 @@ public:
     std::function<void()>      onMoveUp;
     std::function<void()>      onMoveDown;
 
-    // Fired when user types a value into the PDC override field. Pass
-    // kPdcUnknown to clear the override and fall back to the auto-measured
-    // value. Value is in samples.
+    // Fired when user types a value into the Latency field. Pass
+    // kPdcUnknown to clear the override (display reverts to "—"). Value
+    // is in samples.
     std::function<void(long long)> onPdcOverrideChanged;
 
     // Disable up/down buttons at the top/bottom of the display order.
@@ -107,14 +105,10 @@ private:
     juce::Label         norm_target_label_;   // editable: per-slot target LUFS
     juce::Label         norm_db_label_;       // readonly: current normalize gain in dB
 
-    // PDC display: caption + editable ms field. Empty/blank input means
-    // "no override" — fall back to the auto-measured value (shown as
-    // caption text).
+    // Latency display: editable ms field, manual override only.
     juce::Label         pdc_label_;
-    long long           pdc_measured_samples_ { kPdcUnknown };
     long long           pdc_override_samples_ { kPdcUnknown };
     double              pdc_sample_rate_      { 0.0 };
-    float               pdc_confidence_       { 0.0f };
     void                updatePdcLabel();
     juce::Slider        gain_slider_;
     LayerLane           lane_;

@@ -180,63 +180,25 @@ void SatelliteProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mi
     juce::ScopedNoDenormals noDenormals;
     const int frames = buffer.getNumSamples();
 
-    // Honor hub's PDC-calibration spike request. When inject_spike is set,
-    // we overwrite the first 4 samples of the buffer with a known impulse
-    // pattern (+1, -1, +1, -1) — both in the output (so it propagates
-    // through Bitwig's track-output PDC delay to hub's input) and in our
-    // SHM ring (so hub can locate the spike from sat's side too). The
-    // difference between sat's spike wp and hub's input wp at which the
-    // spike appears equals the per-track output delay.
-    // Read playhead for both PDC bookkeeping and (if needed) spike injection.
-    std::int64_t hfs_at_block_start = 0;
-    bool         pb_playing         = false;
-    bool         pb_have_frame      = false;
+    // Only push audio into the SHM ring while host transport is playing.
+    // Bitwig (and others) keep calling processBlock during transport stop
+    // with empty/zombie input audio; if we wrote those blocks too, sat_wp
+    // would keep advancing across Stop→Play cycles by non-deterministic
+    // amounts (depending on wall-clock timing of host callbacks), which
+    // made recording_start_wp_ on the hub side drift between recordings
+    // even when the user pressed Play from the same master position.
+    // Skipping writes during stop pins sat_wp to "where it was at the end
+    // of the most recent playing period", which gives the hub a stable
+    // anchor for recording.
+    bool pb_playing = false;
     if (auto* ph = getPlayHead()) {
         if (auto pos = ph->getPosition()) {
             pb_playing = pos->getIsPlaying();
-            if (auto t = pos->getTimeInSamples()) {
-                hfs_at_block_start = *t;
-                pb_have_frame = true;
-            }
         }
     }
-
-    // PDC spike injection. Hub sets `inject_spike` for all live sats at
-    // once. Each sat waits `slot_index` additional blocks before firing
-    // its spike (so slot 0 fires in the next block, slot 1 the one after,
-    // etc.). This staggering means hub sees each sat's spike in its own
-    // unambiguous block of input, avoiding superposition issues.
-    if (region_ != nullptr && frames >= 4 && pb_playing && pb_have_frame) {
-        const int idx = slot_index_.load(std::memory_order_acquire);
-        if (idx >= 0 && idx < static_cast<int>(gatherer::protocol::NUM_SLOTS)) {
-            auto& slot = region_->slots[idx];
-
-            // Pick up new trigger and start countdown if currently idle.
-            if (cali_block_countdown_ < 0) {
-                std::uint32_t want = 1u;
-                if (slot.inject_spike.compare_exchange_strong(want, 0u,
-                                                                std::memory_order_acq_rel)) {
-                    cali_block_countdown_ = idx;  // fire in (idx + 1)th block from now
-                }
-            }
-
-            if (cali_block_countdown_ == 0) {
-                const float pat[4] = { 1.0f, -1.0f, 1.0f, -1.0f };
-                for (int ch = 0; ch < buffer.getNumChannels(); ++ch) {
-                    auto* w = buffer.getWritePointer(ch);
-                    for (int i = 0; i < 4; ++i) w[i] = pat[i];
-                }
-                SpscRingBuffer rb_wp(slot.ring_header, slot.ring_data, RING_FRAMES, RING_CHANNELS);
-                slot.spike_wp          .store(rb_wp.writePos(), std::memory_order_release);
-                slot.spike_master_frame.store(hfs_at_block_start, std::memory_order_release);
-                cali_block_countdown_ = -1;
-            } else if (cali_block_countdown_ > 0) {
-                --cali_block_countdown_;
-            }
-        }
+    if (pb_playing) {
+        writeInterleavedToRing(buffer, frames);
     }
-
-    writeInterleavedToRing(buffer, frames);
     // Pass-through: leave buffer untouched.
 }
 

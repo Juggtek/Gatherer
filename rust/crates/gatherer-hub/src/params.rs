@@ -89,6 +89,10 @@ pub struct HubParams {
     pub sources: Arc<Vec<Arc<SourceParams>>>,
     pub master_peak_l: Arc<AtomicF32>,
     pub master_peak_r: Arc<AtomicF32>,
+    /// Per-source playback normalization gain (linear). Updated by the UI
+    /// from `target_lufs - integrated_lufs`; the audio thread reads it on
+    /// each block. Default 1.0 (no normalization).
+    pub normalization_gains: Arc<Vec<AtomicF32>>,
 }
 
 impl HubParams {
@@ -97,11 +101,15 @@ impl HubParams {
         let sources = (0..num_sources)
             .map(|_| Arc::new(SourceParams::new()))
             .collect::<Vec<_>>();
+        let normalization_gains = (0..num_sources)
+            .map(|_| AtomicF32::new(1.0))
+            .collect::<Vec<_>>();
         Self {
             master_gain: Arc::new(AtomicF32::new(1.0)),
             sources: Arc::new(sources),
             master_peak_l: Arc::new(AtomicF32::new(0.0)),
             master_peak_r: Arc::new(AtomicF32::new(0.0)),
+            normalization_gains: Arc::new(normalization_gains),
         }
     }
 

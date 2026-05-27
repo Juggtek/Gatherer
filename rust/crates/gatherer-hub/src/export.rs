@@ -140,6 +140,7 @@ mod tests {
             start_pulses: 0,
             bpm: 120.0,
             time_sig_num: 4,
+            armed: vec![0],
         };
 
         let session_root = std::env::temp_dir()

@@ -242,55 +242,21 @@ public:
         return &expected_samples_[slot];
     }
 
-    // --- Per-sat PDC measurement ---------------------------------------------
-    // Each sat's audio at its ring's wp = X represents music position
-    // (master_at_wp_X + D) — D > 0 means the DAW pre-rolled this sat's
-    // upstream chain (typically a latent sampler) so its output reaches
-    // master in time. We can't read D from any host API (Bitwig passes a
-    // uniform master playhead to every plugin regardless of track PDC), so
-    // we measure it by cross-correlating each sat's SHM stream against the
-    // hub's own input — which is PDC-aligned by the DAW and so serves as
-    // the absolute-time reference.
-    //
-    // `pdc_d_samples_[i]` is the latest *measured* D for slot i. Updated by
-    // the PdcCalibrator background thread. INT64_MIN sentinel = not yet
-    // measured. `pdc_d_override_[i]` is a user-set value that takes
-    // precedence (UI: editable per-track field) when not INT64_MIN.
-    std::int64_t pdcDMeasured(int slot) const noexcept {
-        if (slot < 0 || slot >= static_cast<int>(pdc_d_samples_.size())) return kPdcUnknown;
-        return pdc_d_samples_[static_cast<std::size_t>(slot)].load(std::memory_order_relaxed);
-    }
+    // --- Per-sat PDC (manual only) -------------------------------------------
+    // Auto-measurement was removed — every host model we tried produced a
+    // structurally meaningless 0 (compensated playhead + pre-rolled sat),
+    // and the noise around that did more harm than help. The Latency field
+    // on each row writes pdc_d_override_; the writer's start_wp subtracts
+    // pdcDEffective(slot) from the spike-anchored read position.
+    static constexpr std::int64_t kPdcUnknown = std::numeric_limits<std::int64_t>::min();
+
     std::int64_t pdcDOverride(int slot) const noexcept {
         if (slot < 0 || slot >= static_cast<int>(pdc_d_override_.size())) return kPdcUnknown;
         return pdc_d_override_[static_cast<std::size_t>(slot)].load(std::memory_order_relaxed);
     }
-    // Returns the value the writer/recorder should actually apply: override
-    // if set, else measured (only if VERY confident), else 0.
-    //
-    // The threshold is intentionally high (0.7) because cross-correlation
-    // against a busy mix is noisy: spurious peaks routinely land between
-    // 0.2-0.5. Applying a wrong D makes recordings strictly worse than no
-    // compensation, so we only apply when the peak is unambiguous. Users
-    // with tracks that the auto-measurement can't reach (sustained pads,
-    // quiet content, short clips) can set the override manually from
-    // their DAW's reported per-track latency.
-    static constexpr float kPdcMinConfidence = 0.70f;
     std::int64_t pdcDEffective(int slot) const noexcept {
         const auto ov = pdcDOverride(slot);
-        if (ov != kPdcUnknown) return ov;
-        const auto m = pdcDMeasured(slot);
-        if (m == kPdcUnknown) return 0;
-        if (pdcConfidence(slot) < kPdcMinConfidence) return 0;
-        // Reject measurements pegged at the search boundary — those are
-        // almost always wrong (either no real peak, or true D is beyond
-        // the search range and we landed at the edge).
-        const auto abs_m = m < 0 ? -m : m;
-        // boundary equals the calibrator's K (= 4096 samples). A measurement
-        // landing within 8 samples of the boundary almost certainly means
-        // the true peak is outside the search range — reject it.
-        constexpr std::int64_t kBoundaryGuard = 4088;
-        if (abs_m >= kBoundaryGuard) return 0;
-        return m;
+        return (ov == kPdcUnknown) ? 0 : ov;
     }
     void setPdcDOverride(int slot, std::int64_t samples) noexcept {
         if (slot < 0 || slot >= static_cast<int>(pdc_d_override_.size())) return;
@@ -300,24 +266,6 @@ public:
         if (slot < 0 || slot >= static_cast<int>(pdc_d_override_.size())) return;
         pdc_d_override_[static_cast<std::size_t>(slot)].store(kPdcUnknown, std::memory_order_relaxed);
     }
-    static constexpr std::int64_t kPdcUnknown = std::numeric_limits<std::int64_t>::min();
-
-    // Per-sat solo-calibration: hub iterates active sats, mutes every sat's
-    // output except the one being measured, lets the ref ring fill with the
-    // isolated sat's content, then cross-correlates. Triggered by the
-    // Calibrate button when transport is playing. State is published so the
-    // UI can show a progress indicator.
-    void startSoloCalibration();
-    void cancelSoloCalibration();
-    enum class SoloCaliState : std::uint8_t { Idle, Capturing, Measuring, Done, Failed };
-    struct SoloCaliStatus {
-        SoloCaliState state             = SoloCaliState::Idle;
-        int           current_slot      = -1;
-        int           total_slots       = 0;
-        int           completed_slots   = 0;
-        std::string   message;
-    };
-    SoloCaliStatus soloCaliStatus() const noexcept;
 
     // True when this AudioProcessor is being hosted by JUCE's standalone wrapper
     // (`Gatherer Hub.app`) rather than a DAW. Editors use it to choose deployment-
@@ -567,88 +515,9 @@ private:
     std::unique_ptr<LufsWorker> lufs_worker_;
     void lufsWorkerTick();
 
-    // --- PDC measurement -----------------------------------------------------
-    // Hub captures its input audio (PDC-aligned mix from the parent bus) into
-    // a mono reference ring. The PdcCalibrator worker periodically cross-
-    // correlates each active sat's SHM stream against this ring to estimate
-    // per-sat D.
-    static constexpr std::uint32_t kPdcRefCapacity = 524288u;  // ~10.9s @ 48k, power of two
-                                                                // (big enough that clip-gated sats
-                                                                // whose last write was many seconds ago
-                                                                // can still be correlated against
-                                                                // recent hub data)
-    gatherer::SpscRingBuffer::Header   pdc_ref_header_{};
-    std::vector<float>                 pdc_ref_data_;  // size = kPdcRefCapacity, mono
-    std::atomic<std::int64_t>          pdc_ref_anchor_host_frame_{ 0 };  // master frame at hub's first ref-ring write
-    std::atomic<bool>                  pdc_ref_anchor_set_{ false };
-    // Published every hub processBlock during playback: (master frame at
-    // start of that block, hub's wp value at start of that block). The
-    // anchor+wp method gives the wrong master time as soon as transport
-    // jumps/stops/restarts. This pair tells the worker thread "as of the
-    // most recent playing callback, hub_wp = X corresponded to master
-    // frame Y" — so the worker can interpolate backward for any recent wp.
-    std::atomic<std::int64_t>          pdc_latest_block_master_  { 0 };
-    std::atomic<std::uint64_t>         pdc_latest_block_wp_      { 0 };
-
-    std::array<std::atomic<std::int64_t>, gatherer::protocol::NUM_SLOTS> pdc_d_samples_;
+    // --- PDC (manual override only) ------------------------------------------
+    // pdc_d_override_[i] holds the user-typed Latency-field value for slot i,
+    // in samples (kPdcUnknown sentinel = "leave at 0 / auto"). Persisted as
+    // part of the plugin state and session manifest.
     std::array<std::atomic<std::int64_t>, gatherer::protocol::NUM_SLOTS> pdc_d_override_;
-    // Debug counters — increment per calibrator iteration / per successful
-    // measurement so the UI can show "is the calibrator even alive?".
-    std::atomic<std::uint64_t>                                            pdc_tick_count_       { 0 };
-    std::atomic<std::uint64_t>                                            pdc_success_count_    { 0 };
-
-public:
-    std::uint64_t pdcTickCount()    const noexcept { return pdc_tick_count_.load(std::memory_order_relaxed); }
-    std::uint64_t pdcSuccessCount() const noexcept { return pdc_success_count_.load(std::memory_order_relaxed); }
-
-    // Per-slot last-skip reason. Empty string = either the slot is not
-    // active, or the last attempt succeeded.
-    enum class PdcSkip : std::uint8_t {
-        Ok = 0,
-        SlotInactive,
-        SatNotWritten,
-        SatNotEnoughData,
-        SatRingOverrun,
-        SatSilent,
-        HubWindowBeforeZero,
-        HubWindowPastWrite,
-        HubWindowOutOfCap,
-        HubSilent,
-    };
-    PdcSkip pdcLastSkip(int slot) const noexcept {
-        if (slot < 0 || slot >= static_cast<int>(pdc_last_skip_.size())) return PdcSkip::SlotInactive;
-        return static_cast<PdcSkip>(pdc_last_skip_[static_cast<std::size_t>(slot)].load(std::memory_order_relaxed));
-    }
-    // Normalized correlation coefficient at the peak lag (0..1). Near 1 =
-    // strong match. Near 0 = no real match found (random noise peak).
-    float pdcConfidence(int slot) const noexcept {
-        if (slot < 0 || slot >= static_cast<int>(pdc_confidence_.size())) return 0.0f;
-        return pdc_confidence_[static_cast<std::size_t>(slot)].load(std::memory_order_relaxed);
-    }
-private:
-    std::array<std::atomic<std::uint8_t>, gatherer::protocol::NUM_SLOTS> pdc_last_skip_{};
-    std::array<std::atomic<float>,        gatherer::protocol::NUM_SLOTS> pdc_confidence_{};
-
-    class PdcCalibrator : public juce::Thread {
-    public:
-        explicit PdcCalibrator(HubProcessor& p)
-            : juce::Thread("GathererPdc"), processor_(p) {}
-        void run() override;
-    private:
-        HubProcessor& processor_;
-    };
-    std::unique_ptr<PdcCalibrator> pdc_calibrator_;
-    void runSpikeCalibration();
-    bool measureOneSatSpike(int slot);
-
-    // Calibration state (driven by PdcCalibrator's run loop when
-    // `solo_cali_active_` is set). "Solo cali" naming is legacy from the
-    // previous mute-others approach; current mechanism is spike injection.
-    std::atomic<bool>            solo_cali_active_      { false };
-    std::atomic<int>             solo_cali_current_     { -1 };
-    std::atomic<int>             solo_cali_total_       { 0 };
-    std::atomic<int>             solo_cali_completed_   { 0 };
-    std::atomic<std::uint8_t>    solo_cali_state_       { static_cast<std::uint8_t>(SoloCaliState::Idle) };
-    juce::CriticalSection        solo_cali_message_lock_;
-    std::string                  solo_cali_message_;
 };

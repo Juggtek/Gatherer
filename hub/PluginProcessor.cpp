@@ -63,8 +63,7 @@ HubProcessor::HubProcessor()
 
     // PDC: start all sat estimates and overrides as unknown so the UI can
     // show "not measured yet" until cross-correlation produces a value.
-    for (auto& a : pdc_d_samples_)   a.store(kPdcUnknown, std::memory_order_relaxed);
-    for (auto& a : pdc_d_override_)  a.store(kPdcUnknown, std::memory_order_relaxed);
+    for (auto& a : pdc_d_override_) a.store(kPdcUnknown, std::memory_order_relaxed);
 
     my_uuid_ = generateInstanceId();
     // Standalone defaults to summing system-audio input with the sat mix (otherwise
@@ -91,11 +90,6 @@ HubProcessor::HubProcessor()
 HubProcessor::~HubProcessor() {
     // Stop background workers first — they read sat rings via region_, so they
     // must be torn down before detachFromShm clears the region pointer.
-    if (pdc_calibrator_) {
-        pdc_calibrator_->signalThreadShouldExit();
-        pdc_calibrator_->stopThread(1000);
-        pdc_calibrator_.reset();
-    }
     if (lufs_worker_) {
         lufs_worker_->signalThreadShouldExit();
         lufs_worker_->stopThread(1000);
@@ -170,21 +164,6 @@ void HubProcessor::prepareToPlay(double sampleRate, int samplesPerBlock) {
     lufs_worker_ = std::make_unique<LufsWorker>(*this);
     lufs_worker_->startThread();
 
-    // PDC measurement: allocate the mono reference ring and (re)start the
-    // calibrator. The ring stores hub's PDC-aligned input audio; the worker
-    // periodically cross-correlates each sat against this reference to
-    // estimate per-sat D.
-    if (pdc_calibrator_) {
-        pdc_calibrator_->signalThreadShouldExit();
-        pdc_calibrator_->stopThread(1000);
-        pdc_calibrator_.reset();
-    }
-    pdc_ref_data_.assign(static_cast<std::size_t>(kPdcRefCapacity), 0.0f);
-    gatherer::SpscRingBuffer::initialize(pdc_ref_header_);
-    pdc_ref_anchor_set_.store(false, std::memory_order_release);
-    pdc_calibrator_ = std::make_unique<PdcCalibrator>(*this);
-    pdc_calibrator_->startThread();
-
     playback_.prepare(sampleRate, samplesPerBlock);
 
     // Report 1-block PDC latency so the host can compensate. The hub may receive a
@@ -201,11 +180,6 @@ void HubProcessor::prepareToPlay(double sampleRate, int samplesPerBlock) {
 }
 
 void HubProcessor::releaseResources() {
-    if (pdc_calibrator_) {
-        pdc_calibrator_->signalThreadShouldExit();
-        pdc_calibrator_->stopThread(1000);
-        pdc_calibrator_.reset();
-    }
     if (lufs_worker_) {
         lufs_worker_->signalThreadShouldExit();
         lufs_worker_->stopThread(1000);
@@ -293,267 +267,6 @@ void HubProcessor::lufsWorkerTick() {
     }
 }
 
-void HubProcessor::PdcCalibrator::run() {
-    while (!threadShouldExit()) {
-        if (processor_.solo_cali_active_.load(std::memory_order_acquire)) {
-            processor_.runSpikeCalibration();
-            processor_.solo_cali_active_.store(false, std::memory_order_release);
-        }
-        wait(200);
-    }
-}
-
-void HubProcessor::startSoloCalibration() {
-    // Idempotent: only allow start if not already in progress.
-    bool expected = false;
-    if (!solo_cali_active_.compare_exchange_strong(expected, true,
-                                                    std::memory_order_acq_rel)) {
-        return;
-    }
-    solo_cali_state_.store(static_cast<std::uint8_t>(SoloCaliState::Capturing),
-                            std::memory_order_release);
-    {
-        const juce::ScopedLock sl(solo_cali_message_lock_);
-        solo_cali_message_ = "Starting solo calibration...";
-    }
-}
-
-void HubProcessor::cancelSoloCalibration() {
-    solo_cali_active_.store(false, std::memory_order_release);
-}
-
-HubProcessor::SoloCaliStatus HubProcessor::soloCaliStatus() const noexcept {
-    SoloCaliStatus s;
-    s.state           = static_cast<SoloCaliState>(solo_cali_state_.load(std::memory_order_relaxed));
-    s.current_slot    = solo_cali_current_  .load(std::memory_order_relaxed);
-    s.total_slots     = solo_cali_total_    .load(std::memory_order_relaxed);
-    s.completed_slots = solo_cali_completed_.load(std::memory_order_relaxed);
-    {
-        const juce::ScopedLock sl(const_cast<juce::CriticalSection&>(solo_cali_message_lock_));
-        s.message = solo_cali_message_;
-    }
-    return s;
-}
-
-// Spike-based PDC calibration. Replaces the previous cross-correlation
-// approach (too noisy against a busy mix; solo-mute changed the PDC
-// graph in ways that made the measurement meaningless). New approach:
-// hub asks each sat to inject a known impulse pattern into its output;
-// Bitwig's per-track output-side PDC delay then carries the spike to
-// hub's input with that delay baked in. The difference between sat's
-// own spike wp and the spike's arrival wp in hub's input ring is
-// exactly the per-track output delay we want to compensate for.
-void HubProcessor::runSpikeCalibration() {
-    if (region_ == nullptr || !is_hub_) {
-        solo_cali_state_.store(static_cast<std::uint8_t>(SoloCaliState::Failed),
-                                std::memory_order_release);
-        const juce::ScopedLock sl(solo_cali_message_lock_);
-        solo_cali_message_ = "Hub not active.";
-        return;
-    }
-
-    // Find slots that are not just claimed (state == ACTIVE) but ALSO
-    // currently receiving processBlock callbacks. Slots can be in ACTIVE
-    // state but stale (host crashed without cleanup, slot reclaim window
-    // hasn't elapsed yet). The HealthMonitor flags these as "ghosts"; we
-    // must skip them or we'll wait 200ms per ghost while sat fails to
-    // ever set the spike_wp.
-    //
-    // Heartbeat liveness: snapshot sat_heartbeat, sleep briefly, snapshot
-    // again. If the counter advanced, sat is firing — include it.
-    std::array<std::uint32_t, gatherer::protocol::NUM_SLOTS> hb_before{};
-    for (std::uint32_t i = 0; i < gatherer::protocol::NUM_SLOTS; ++i) {
-        hb_before[i] = static_cast<std::uint32_t>(
-            region_->slots[i].sat_heartbeat.load(std::memory_order_relaxed));
-    }
-    juce::Thread::getCurrentThread()->wait(80);
-    std::vector<int> active_slots;
-    for (std::uint32_t i = 0; i < gatherer::protocol::NUM_SLOTS; ++i) {
-        if (region_->slots[i].state.load(std::memory_order_acquire)
-            != gatherer::protocol::SLOT_STATE_ACTIVE) continue;
-        // Must have a non-zero UUID — slot reclaim sometimes leaves
-        // SLOT_STATE_ACTIVE flagged briefly with sat_uuid=0.
-        if (region_->slots[i].sat_uuid.load(std::memory_order_relaxed) == 0) continue;
-        const auto hb_after = static_cast<std::uint32_t>(
-            region_->slots[i].sat_heartbeat.load(std::memory_order_relaxed));
-        // Heartbeat must have advanced AT LEAST a few times in 80ms (a
-        // live sat at typical buffer sizes fires ~50-500 times/sec, so
-        // ≥4 in 80ms is a conservative floor). This catches the case
-        // where a defunct sat plugin's thread occasionally bumps the
-        // heartbeat as it gets torn down.
-        if (hb_after - hb_before[i] < 4) continue;
-        active_slots.push_back(static_cast<int>(i));
-    }
-    solo_cali_total_    .store(static_cast<int>(active_slots.size()), std::memory_order_release);
-    solo_cali_completed_.store(0, std::memory_order_release);
-
-    if (active_slots.empty()) {
-        solo_cali_state_.store(static_cast<std::uint8_t>(SoloCaliState::Failed),
-                                std::memory_order_release);
-        const juce::ScopedLock sl(solo_cali_message_lock_);
-        solo_cali_message_ = "No live sats to calibrate — press Play in the host first.";
-        return;
-    }
-
-    // Up-front check: transport must be playing for the calibration to
-    // work (sat plugins only fire processBlock during playback in
-    // clip-gated tracks, and hub's ref ring only captures audio while
-    // playing).
-    if (!last_seen_playing_.load(std::memory_order_acquire)) {
-        solo_cali_state_.store(static_cast<std::uint8_t>(SoloCaliState::Failed),
-                                std::memory_order_release);
-        const juce::ScopedLock sl(solo_cali_message_lock_);
-        solo_cali_message_ = "Transport is stopped — press Play in the host first, then click Calibrate.";
-        return;
-    }
-
-    // Trigger ALL live sats in one go. Each sat injects its spike in a
-    // different block (slot 0 immediately, slot 1 one block later, etc.)
-    // so hub sees each one in its own unambiguous time window. Single
-    // Calibrate click → every sat sends a signal in parallel, the way
-    // the user described.
-    {
-        const juce::ScopedLock sl(solo_cali_message_lock_);
-        solo_cali_message_ = "Triggering spikes on all live sats...";
-    }
-    int max_slot_idx = 0;
-    for (int slot : active_slots) {
-        auto& sslot = region_->slots[slot];
-        sslot.spike_wp           .store(0, std::memory_order_release);
-        sslot.spike_master_frame .store(0, std::memory_order_release);
-        sslot.inject_spike       .store(1u, std::memory_order_release);
-        if (slot > max_slot_idx) max_slot_idx = slot;
-    }
-
-    // Wait long enough for every sat to fire its delayed spike AND for
-    // hub to capture it. Worst-case: max_slot_idx blocks of staggering +
-    // a few blocks of propagation through the parent bus + safety.
-    // At typical Bitwig block sizes ~5ms, 16 slots * 5 + 100 ≈ 180ms is
-    // plenty.
-    juce::Thread::getCurrentThread()->wait(300);
-    if (!solo_cali_active_.load(std::memory_order_acquire)) {
-        solo_cali_state_.store(static_cast<std::uint8_t>(SoloCaliState::Failed),
-                                std::memory_order_release);
-        return;
-    }
-
-    int successes = 0;
-    std::string last_fail;
-    for (int slot : active_slots) {
-        solo_cali_current_.store(slot, std::memory_order_release);
-        {
-            const juce::ScopedLock sl(solo_cali_message_lock_);
-            solo_cali_message_ = "Locating slot " + std::to_string(slot) + " spike...";
-        }
-        const bool ok = measureOneSatSpike(slot);
-        solo_cali_completed_.fetch_add(1, std::memory_order_release);
-        if (ok) {
-            ++successes;
-        } else {
-            last_fail = "Slot " + std::to_string(slot)
-                       + ": spike not detected — track may be clip-gated "
-                         "(no audio at the current playhead).";
-        }
-    }
-
-    solo_cali_current_.store(-1, std::memory_order_release);
-    if (successes > 0) {
-        solo_cali_state_.store(static_cast<std::uint8_t>(SoloCaliState::Done),
-                                std::memory_order_release);
-        const juce::ScopedLock sl(solo_cali_message_lock_);
-        solo_cali_message_ = "Spike calibration: "
-                            + std::to_string(successes) + "/"
-                            + std::to_string(static_cast<int>(active_slots.size()))
-                            + " sats measured.";
-    } else {
-        solo_cali_state_.store(static_cast<std::uint8_t>(SoloCaliState::Failed),
-                                std::memory_order_release);
-        const juce::ScopedLock sl(solo_cali_message_lock_);
-        solo_cali_message_ = last_fail.empty()
-            ? "Calibration failed — no sats produced a measurable spike."
-            : last_fail;
-    }
-}
-
-bool HubProcessor::measureOneSatSpike(int target_slot) {
-    if (region_ == nullptr) return false;
-    auto& slot = region_->slots[target_slot];
-
-    if (pdc_ref_data_.empty()) return false;
-    if (!pdc_ref_anchor_set_.load(std::memory_order_acquire)) return false;
-
-    // Flags were already set by runSpikeCalibration; just read what sat
-    // published (if anything).
-    const auto sat_spike_wp      = slot.spike_wp.load(std::memory_order_acquire);
-    const auto sat_spike_master  = slot.spike_master_frame.load(std::memory_order_acquire);
-    if (sat_spike_wp == 0 || sat_spike_master == 0) {
-        // Sat never fired (clip-gated, transport stopped right after
-        // we set the flag, or sat plugin didn't actually receive
-        // processBlock during the wait window).
-        slot.inject_spike.store(0u, std::memory_order_release);
-        return false;
-    }
-
-    // Find the spike pattern (+1, -1, +1, -1) in hub's ref ring. Ring
-    // entries are mono-summed (L+R)/2. Use a 4-tap matched filter:
-    //   score[k] = ref[k] - ref[k+1] + ref[k+2] - ref[k+3]
-    // Peaks at ~4 when the pattern lands at k (each sample contributes
-    // ~+1 in magnitude after the sign-flips align), ~0 otherwise.
-    const auto cap         = static_cast<std::uint32_t>(pdc_ref_data_.size());
-    const auto hub_mask    = cap - 1u;
-    const auto hub_wp_now  = pdc_ref_header_.write_pos.load(std::memory_order_acquire);
-
-    // Search a 250-ms window of recent hub data.
-    const std::uint32_t kSearchFrames = 12000;
-    if (hub_wp_now < kSearchFrames + 4) return false;
-    const std::uint64_t search_start = hub_wp_now - kSearchFrames;
-
-    double best_score = 0.0;
-    std::uint64_t best_wp = 0;
-    for (std::uint32_t k = 0; k + 3 < kSearchFrames; ++k) {
-        const auto wp = search_start + k;
-        const float a = pdc_ref_data_[static_cast<std::uint32_t>((wp    ) & hub_mask)];
-        const float b = pdc_ref_data_[static_cast<std::uint32_t>((wp + 1) & hub_mask)];
-        const float c = pdc_ref_data_[static_cast<std::uint32_t>((wp + 2) & hub_mask)];
-        const float d = pdc_ref_data_[static_cast<std::uint32_t>((wp + 3) & hub_mask)];
-        const double score = static_cast<double>(a) - b + c - d;
-        if (score > best_score) { best_score = score; best_wp = wp; }
-    }
-
-    // The spike pattern produces score ~ 4 in clean conditions; if music
-    // is mixed in, the score may be reduced but the spike-on-music
-    // contribution is still ~3-4. Anything below ~1.5 means we didn't
-    // find a real spike — could be: transport stopped after trigger,
-    // sat track muted, or spike too attenuated by downstream processing.
-    if (best_score < 1.5) {
-        return false;
-    }
-
-    // Convert hub's spike position to master frame and diff against
-    // sat's directly-published master frame. Use the most recent
-    // (master, wp) pair published from hub's processBlock — this stays
-    // correct even when transport stops/restarts/jumps, unlike the
-    // hub_anchor + hub_wp approach.
-    const auto latest_wp     = pdc_latest_block_wp_    .load(std::memory_order_acquire);
-    const auto latest_master = pdc_latest_block_master_.load(std::memory_order_relaxed);
-    if (latest_wp == 0) return false;  // no playing block recorded yet
-    const std::int64_t hub_master =
-        latest_master + (static_cast<std::int64_t>(best_wp) - static_cast<std::int64_t>(latest_wp));
-    const std::int64_t offset = hub_master - sat_spike_master;
-
-    pdc_d_samples_[target_slot].store(offset, std::memory_order_relaxed);
-    pdc_confidence_[target_slot].store(static_cast<float>(std::min(1.0, best_score / 4.0)),
-                                         std::memory_order_relaxed);
-    {
-        const juce::ScopedLock sl(solo_cali_message_lock_);
-        solo_cali_message_ = "Slot " + std::to_string(target_slot)
-                            + ": spike found, offset = "
-                            + std::to_string(offset) + " samples ("
-                            + std::to_string(offset * 1000 / 48) + " ms approx)";
-    }
-    return true;
-}
-
 bool HubProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const {
     return layouts.getMainOutputChannelSet() == juce::AudioChannelSet::stereo()
         && (layouts.getMainInputChannelSet() == juce::AudioChannelSet::stereo()
@@ -564,60 +277,13 @@ void HubProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuff
     juce::ScopedNoDenormals noDenormals;
     const int frames = buffer.getNumSamples();
 
-    // PDC reference capture. Hub's input *is* the parent-bus mix as the DAW
-    // hands it to us — by which point the DAW has already applied PDC across
-    // every child track. That makes it a sample-accurate reference for
-    // "music at master time T". Push a mono-summed copy into the ref ring
-    // before we touch the buffer.
-    //
-    // Critical: write to the ref ring ONLY when transport is playing, and
-    // anchor wp=0 to the master frame at the first playing block. This
-    // makes (hub_anchor + hub_wp) == master frame at the latest written
-    // sample, which the cross-correlator relies on to find sat content
-    // in hub's ring. If we wrote on every callback regardless of playing
-    // state, hub_wp would track wall-clock callbacks rather than master
-    // time, and any data written while transport was stopped would push
-    // the corresponding hub window past the ref ring's capacity.
-    if (!pdc_ref_data_.empty() && frames > 0) {
-        bool playing_now = false;
-        std::int64_t hfs_at_block_start = 0;
-        bool have_hfs = false;
-        if (auto* ph = getPlayHead()) {
-            if (auto pos = ph->getPosition()) {
-                playing_now = pos->getIsPlaying();
-                if (auto t = pos->getTimeInSamples()) {
-                    hfs_at_block_start = *t;
-                    have_hfs = true;
-                }
-            }
-        }
-        if (playing_now && have_hfs) {
-            const auto* L = buffer.getReadPointer(0);
-            const auto* R = buffer.getNumChannels() > 1 ? buffer.getReadPointer(1) : L;
-            const auto cap  = static_cast<std::uint32_t>(pdc_ref_data_.size());
-            const auto mask = cap - 1u;
-            const auto wp_before = pdc_ref_header_.write_pos.load(std::memory_order_relaxed);
-            for (int i = 0; i < frames; ++i) {
-                const auto idx = static_cast<std::uint32_t>((wp_before + static_cast<std::uint64_t>(i)) & mask);
-                pdc_ref_data_[idx] = 0.5f * (L[i] + R[i]);
-            }
-            pdc_ref_header_.write_pos.store(wp_before + static_cast<std::uint64_t>(frames),
-                                             std::memory_order_release);
-
-            // Publish (master frame, hub_wp) for this block so the cali
-            // worker can map any hub_wp to a master frame even when
-            // transport has jumped or anchor is stale. Master first
-            // (with relaxed), then wp (with release) so a worker that
-            // does acquire-load on wp sees a matching master.
-            pdc_latest_block_master_.store(hfs_at_block_start, std::memory_order_relaxed);
-            pdc_latest_block_wp_    .store(wp_before, std::memory_order_release);
-
-            if (!pdc_ref_anchor_set_.load(std::memory_order_relaxed)) {
-                pdc_ref_anchor_host_frame_.store(hfs_at_block_start, std::memory_order_relaxed);
-                pdc_ref_anchor_set_.store(true, std::memory_order_release);
-            }
-        }
-    }
+    // (Auto-PDC measurement was removed — it gave 0 on every Bitwig setup
+    // because the host both pre-rolls upstream sats and hands them a
+    // compensated playhead, leaving no observable lead in either audio or
+    // write-pointer terms. The per-row Latency field is now the sole knob;
+    // type the host-reported track latency in ms. The play-start spike is
+    // still fired by sats and used as a recording anchor — that part works
+    // regardless of host PDC behavior.)
 
     // Input handling — see isIncludeTrackInput() doc.
     //   OFF: discard whatever the host gave us; output is purely the sat-ring mix.
@@ -672,10 +338,23 @@ void HubProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuff
                 if (region_->slots[i].state.load(std::memory_order_acquire) != SLOT_STATE_ACTIVE) continue;
                 if (!mix_[i].record_arm.load(std::memory_order_relaxed)) continue;
 
-                // If the sat occupying this slot has changed since we last
-                // saw it (mid-session reclaim), prev_slot_state_[i].wp refers
-                // to the previous sat's ring and is stale — fall back to the
-                // sat's current wp.
+                // prev_slot_state_[i].wp is sat's wp at the END of hub's
+                // previous block. Combined with the sat-side rule that
+                // sat does NOT write to SHM while the host is stopped,
+                // this value is "sat_wp at the end of the most recent
+                // playing period" — which equals sat_wp at the moment
+                // the user pressed Play this time, since nothing
+                // advanced sat_wp during the intervening stop.
+                //
+                // Sat in the rising-edge block (this hub callback) runs
+                // first (parent-bus topology: upstream sats run before
+                // hub) and writes its first new audio starting AT this
+                // wp. Hub reads from this position → file sample 0 is
+                // the first sample sat wrote for the current Play.
+                //
+                // If the sat occupying this slot has changed mid-session
+                // (UUID mismatch), prev_slot_state_ holds the previous
+                // sat's wp and is stale — fall back to current wp.
                 const auto cur_uuid = region_->slots[i].sat_uuid.load(std::memory_order_acquire);
                 std::uint64_t wp_anchor = prev_slot_state_[i].wp;
                 if (cur_uuid != prev_slot_state_[i].uuid) {
@@ -944,6 +623,16 @@ void HubProcessor::getStateInformation(juce::MemoryBlock& destData) {
                           nullptr);
         slot.setProperty("record_arm",
                           mix_[i].record_arm.load(std::memory_order_relaxed), nullptr);
+        // Per-row Latency override in samples. INT64_MIN sentinel ("auto") is
+        // serialized as the marker -1 so a future migration to a different
+        // sentinel doesn't trip on the raw min-int value. On load we map any
+        // negative value back to kPdcUnknown.
+        const auto pdc_ov = pdcDOverride(static_cast<int>(i));
+        slot.setProperty("pdc_override_samples",
+                          pdc_ov == kPdcUnknown
+                              ? static_cast<juce::int64>(-1)
+                              : static_cast<juce::int64>(pdc_ov),
+                          nullptr);
         mix.appendChild(slot, nullptr);
     }
     tree.appendChild(mix, nullptr);
@@ -1011,6 +700,11 @@ void HubProcessor::setStateInformation(const void* data, int sizeInBytes) {
                                        std::memory_order_relaxed);
             mix_[i].record_arm.store(static_cast<bool>(slot.getProperty("record_arm", false)),
                                       std::memory_order_relaxed);
+            if (slot.hasProperty("pdc_override_samples")) {
+                const auto raw = static_cast<std::int64_t>(
+                    static_cast<juce::int64>(slot.getProperty("pdc_override_samples", -1)));
+                setPdcDOverride(i, raw < 0 ? kPdcUnknown : raw);
+            }
         }
     }
     // (UUID is not restored — we keep the freshly generated one so a project reload
@@ -1288,21 +982,20 @@ bool HubProcessor::actuallyStartRecording() {
         a.display_name     = juce::String::fromUTF8(region_->slots[i].display_name);
         a.thumbnail        = thumbnails_[i].get();
 
-        // Apply per-sat PDC compensation. The cross-correlator measured D
-        // such that sat's content at sat_wp X represents music master_at_X
-        // shifted by D in music time. To make the WAV's frame F hold music
-        // (recording_start + F), the writer must read sat at sat_wp =
-        // snap_wp - D (signed). D > 0 → read earlier (sat is ahead, e.g.
-        // pre-roll); D < 0 → read later (sat is behind, need to wait for
-        // sat to catch up).
-        const auto snap_wp = recording_start_wp_[i].load(std::memory_order_acquire);
+        // Two-layer alignment:
+        //   1. recording_start_wp_[i] is the baseline anchor — sat.spike_wp
+        //      (the wp sat published at its play-start rising edge) when
+        //      the rising-edge snapshot picked it, else prev_slot_state_[i].wp.
+        //   2. pdcDEffective(i) is the per-row Latency override, applied on
+        //      top: a positive value shifts the read position D samples
+        //      earlier in sat's ring so the WAV's sample 0 reflects what
+        //      master heard D samples ago. Type 'auto' / blank / '0' in the
+        //      Latency field to disable. There is no auto-measurement —
+        //      the user types the value their host reports.
+        const auto snap_wp   = recording_start_wp_[i].load(std::memory_order_acquire);
         const auto d_samples = pdcDEffective(static_cast<int>(i));
         const std::int64_t snap_signed = static_cast<std::int64_t>(snap_wp);
         std::int64_t shifted = snap_signed - d_samples;
-        // Clamp to valid ring positions:
-        //   * never below 0
-        //   * never more than RING_FRAMES-1 *behind* snap_wp (we can't read
-        //     older data than the ring holds)
         const std::int64_t min_allowed = std::max<std::int64_t>(
             0, snap_signed - (static_cast<std::int64_t>(gatherer::protocol::RING_FRAMES) - 1));
         if (shifted < min_allowed) shifted = min_allowed;

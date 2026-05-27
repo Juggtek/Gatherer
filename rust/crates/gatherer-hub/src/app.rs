@@ -5,6 +5,7 @@
 //! The 30 Hz tick pulls peak meters from the audio thread. Built-in iced
 //! widgets for now; FIELD's canvas meters/faders are a later polish pass.
 
+use crate::adaptive::AdaptiveMixer;
 use crate::audio::{self, AudioEngine};
 use crate::measurement::{self, LufsMeasurement};
 use crate::midi::{self, MidiSync, PPQN};
@@ -72,6 +73,7 @@ pub enum Message {
     SetLayerName(usize, String),
     SaveSession,
     LoadSession(String),
+    ToggleAdaptive(bool),
     Tick,
 }
 
@@ -133,6 +135,10 @@ pub struct State {
     layer_names: Vec<String>,
     /// Last save/load result for the session status line.
     session_status: Option<String>,
+
+    /// Adaptive mixer — programmatically writes per-source slider values
+    /// based on the (TBD) supplied logic. Off by default.
+    adaptive: AdaptiveMixer,
 }
 
 impl State {
@@ -176,6 +182,7 @@ impl State {
             session_name: String::new(),
             layer_names: Vec::new(),
             session_status: None,
+            adaptive: AdaptiveMixer::new(),
         };
         state.restart_engine();
         state
@@ -340,6 +347,7 @@ impl State {
             }
             Message::SetTargetLufs(lufs) => {
                 self.target_lufs = lufs.clamp(-40.0, 0.0);
+                self.refresh_normalization_gains();
             }
             Message::ExportStems => self.do_export_stems(),
             Message::SetSessionName(name) => {
@@ -353,6 +361,7 @@ impl State {
             }
             Message::SaveSession => self.do_save_session(),
             Message::LoadSession(name) => self.do_load_session(name),
+            Message::ToggleAdaptive(on) => self.adaptive.set_enabled(on),
             Message::Tick => {
                 self.refresh_meters();
                 if let Some(t) = self.pending_load_at {
@@ -361,6 +370,9 @@ impl State {
                         self.load_take();
                     }
                 }
+                // Run the adaptive mixer step (no-op until the logic lands).
+                let playing = self.playback.is_playing();
+                self.adaptive.step(&self.params, playing);
             }
         }
         Task::none()
@@ -418,6 +430,7 @@ impl State {
                     }
                 }
                 self.lufs_results = measurements;
+                self.refresh_normalization_gains();
                 self.playback.set_take(data);
                 self.waveforms = envs.into_iter().collect();
                 self.take_user_offset_units = 0.0;
@@ -431,6 +444,27 @@ impl State {
     /// Write per-source WAVs to `~/Music/Gatherer Exports/session-<ts>/`
     /// in `original/` and `normalized/` flavors. Normalized uses each
     /// source's integrated LUFS measurement to reach `target_lufs`.
+    /// Publish per-source normalization gains (linear) to the audio
+    /// thread. Called when measurements change (after take load) or when
+    /// the user moves the Target LUFS slider.
+    fn refresh_normalization_gains(&self) {
+        for g in self.params.normalization_gains.iter() {
+            g.store(1.0, Ordering::Relaxed);
+        }
+        let Some(rec) = self.recorder.as_ref() else {
+            return;
+        };
+        for &src_idx in &rec.last_armed {
+            let Some(m) = self.lufs_results.get(&src_idx) else {
+                continue;
+            };
+            let g = measurement::normalization_gain(m.integrated, self.target_lufs as f64);
+            if let Some(slot) = self.params.normalization_gains.get(src_idx) {
+                slot.store(g, Ordering::Relaxed);
+            }
+        }
+    }
+
     fn do_save_session(&mut self) {
         if self.session_name.trim().is_empty() {
             self.session_status = Some("type a session name first".into());
@@ -662,6 +696,20 @@ impl State {
         .spacing(8)
         .align_y(Alignment::Center);
 
+        let adaptive_block = row![
+            text("Mixer").width(Length::Fixed(50.0)),
+            checkbox("Adaptive (auto-moves the per-source sliders)", self.adaptive.is_enabled())
+                .on_toggle(Message::ToggleAdaptive),
+            text(if self.adaptive.is_enabled() {
+                format!("active \u{2014} t = {:.1} s", self.adaptive.elapsed_seconds())
+            } else {
+                "off (manual sliders)".to_string()
+            })
+            .size(11),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+
         // ---- LEFT (extension): Normalize & Export + per-source LUFS detail. ----
         let target_row = row![
             text("Target").width(Length::Fixed(60.0)),
@@ -767,6 +815,7 @@ impl State {
             .push(meter_block)
             .push(zoom_block)
             .push(snap_block)
+            .push(adaptive_block)
             .push(Space::with_height(6))
             .push(export_block)
             .push(measurements_block)

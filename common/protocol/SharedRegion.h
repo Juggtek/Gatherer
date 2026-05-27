@@ -90,18 +90,21 @@ struct SatelliteSlot {
     std::atomic<std::uint64_t> cal_start_hub_heartbeat;
     std::atomic<std::uint64_t> cal_start_wp;
 
-    // PDC-calibration spike trigger. Set by hub when it wants this sat to
-    // emit a known impulse pattern into its output (and SHM ring) on the
-    // next processBlock. The spike then traverses Bitwig's track-output
-    // PDC delay before reaching hub — by comparing where the spike appears
-    // in sat's SHM ring vs in hub's input ref ring, we measure the per-
-    // track output delay that the DAW applies. Sat clears the flag back
-    // to 0 after firing once.
-    std::atomic<std::uint32_t> inject_spike;         // 0 = idle, 1 = inject on next block
-    // Sat records the wp at which it wrote the spike (for cleanup later)
-    // AND the master playhead frame at injection time (for the actual
-    // offset calculation — sat_wp ≠ master frame because sat fires on
-    // every callback regardless of transport state).
+    // PDC-calibration spike. Each sat self-fires a known impulse pattern
+    // (+1, -1, +1, -1) into the first 4 samples of its output buffer on
+    // the rising edge of host transport play — no hub trigger required.
+    // The spike traverses Bitwig's per-track output PDC delay before
+    // reaching the hub, so hub can compute that delay by locating the
+    // spike in its own input ring and comparing master timestamps.
+    //
+    // `_reserved_inject_spike` is a legacy field, kept for SHM layout
+    // stability; no code reads or writes it.
+    std::atomic<std::uint32_t> _reserved_inject_spike;
+    // Sat publishes: the wp at which sample 0 of the spike landed in its
+    // ring, and the master playhead frame the sat observed at the firing
+    // block. Hub uses spike_master_frame as the sat's absolute-time
+    // reference for the offset diff (sat_wp ≠ master frame because the
+    // sat's ring advances on every callback regardless of transport).
     std::atomic<std::uint64_t> spike_wp;
     std::atomic<std::int64_t>  spike_master_frame;
 

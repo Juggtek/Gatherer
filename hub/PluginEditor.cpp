@@ -180,13 +180,17 @@ HubEditor::HubEditor(HubProcessor& p)
     };
     addAndMakeVisible(health_reset_button_);
 
+    // Inter-sat callback-alignment probe (Aligned / Yellow / Red badge). The
+    // PDC auto-measurement was removed — per-row Latency fields are the only
+    // way to compensate per-track host delay now.
     calibrate_summary_.setText("Calibration: not run", juce::dontSendNotification);
     calibrate_summary_.setFont(juce::FontOptions(13.0f, juce::Font::bold));
     calibrate_summary_.setJustificationType(juce::Justification::centredLeft);
     addAndMakeVisible(calibrate_summary_);
 
-    calibrate_detail_.setText("Press Calibrate during playback to measure inter-satellite "
-                              "alignment with sample accuracy.",
+    calibrate_detail_.setText("Per-track latency is set per-row via the Latency field. "
+                              "Type the value your host reports in the track inspector "
+                              "(in ms), or 'auto' to clear.",
                               juce::dontSendNotification);
     calibrate_detail_.setFont(juce::FontOptions(12.0f));
     calibrate_detail_.setJustificationType(juce::Justification::topLeft);
@@ -194,28 +198,10 @@ HubEditor::HubEditor(HubProcessor& p)
                                 juce::Colours::white.withAlpha(0.7f));
     addAndMakeVisible(calibrate_detail_);
 
-    pdc_diag_label_.setText("calibrator: starting...", juce::dontSendNotification);
-    pdc_diag_label_.setFont(juce::FontOptions(11.0f));
-    pdc_diag_label_.setJustificationType(juce::Justification::topLeft);
-    pdc_diag_label_.setColour(juce::Label::textColourId,
-                              juce::Colours::yellow.withAlpha(0.85f));
-    addAndMakeVisible(pdc_diag_label_);
-
-    calibrate_button_.setTooltip(
-        "Measure per-track PDC by soloing each sat in turn. Hub mutes "
-        "every sat's output except the one being measured, isolating that "
-        "sat's content in the parent-bus mix, then cross-correlates the "
-        "isolated mix against sat's SHM stream for a clean sample-accurate "
-        "D. Repeats for every active sat. Transport must be playing. Takes "
-        "~1-2 seconds per sat.");
+    calibrate_button_.setTooltip("Run the inter-sat callback-alignment probe.");
     calibrate_button_.onClick = [this] {
-        // Trigger BOTH the legacy callback-level probe (for the existing
-        // green/red badge) and the new solo PDC sweep.
         processor_.startCalibration();
-        processor_.startSoloCalibration();
         calibrate_summary_.setText("Calibrating...", juce::dontSendNotification);
-        calibrate_detail_.setText("Starting solo PDC calibration...",
-                                   juce::dontSendNotification);
         calibrate_badge_color_ = juce::Colours::lightgrey;
         repaint();
     };
@@ -493,44 +479,22 @@ void HubEditor::timerCallback() {
 
     updateHealth();
 
-    // PDC calibrator diagnostic.
+    // Manual-PDC summary. One entry per active satellite, by track name (or
+    // "Sat XXXXXX" if the host hasn't given a name), with the user-entered
+    // override in ms — "—" when left at auto/0.
     {
-        const auto ticks    = processor_.pdcTickCount();
-        const auto succ     = processor_.pdcSuccessCount();
-        juce::String txt = "calibrator: ticks=" + juce::String((long long) ticks)
-                          + " measurements=" + juce::String((long long) succ);
-        // Show per-slot skip reason or measured value so we can see WHY
-        // the calibrator isn't publishing.
-        auto skipName = [](HubProcessor::PdcSkip s) -> const char* {
-            using S = HubProcessor::PdcSkip;
-            switch (s) {
-                case S::Ok:                  return "ok";
-                case S::SlotInactive:        return "inactive";
-                case S::SatNotWritten:       return "sat-no-writes";
-                case S::SatNotEnoughData:    return "sat-need-more";
-                case S::SatRingOverrun:      return "sat-overrun";
-                case S::SatSilent:           return "sat-silent";
-                case S::HubWindowBeforeZero: return "hub<0";
-                case S::HubWindowPastWrite:  return "hub>wp";
-                case S::HubWindowOutOfCap:   return "hub-too-old";
-                case S::HubSilent:           return "hub-silent";
-            }
-            return "?";
-        };
         const double sr = processor_.getSampleRate();
-        for (std::uint32_t i = 0; i < gatherer::protocol::NUM_SLOTS; ++i) {
-            if (processor_.pdcLastSkip(static_cast<int>(i)) == HubProcessor::PdcSkip::SlotInactive
-                && processor_.pdcDMeasured(static_cast<int>(i)) == HubProcessor::kPdcUnknown) continue;
-            txt += "  s" + juce::String((int) i) + ":";
-            const auto d = processor_.pdcDMeasured(static_cast<int>(i));
-            if (d != HubProcessor::kPdcUnknown) {
-                const double ms   = (sr > 0.0) ? (static_cast<double>(d) / sr) * 1000.0 : 0.0;
-                const float  conf = processor_.pdcConfidence(static_cast<int>(i));
-                txt += juce::String((long long) d) + "s("
-                     + juce::String(ms, 1) + "ms@"
-                     + juce::String(conf, 2) + ")";
+        juce::String txt = "Latency:";
+        for (const auto& sat : processor_.snapshotSatellites()) {
+            const auto name = sat.track_name.isNotEmpty() ? sat.track_name
+                                                          : sat.display_name;
+            const auto ov = processor_.pdcDOverride(sat.slot_index);
+            txt += "  " + name + ":";
+            if (ov == HubProcessor::kPdcUnknown) {
+                txt += "—";
             } else {
-                txt += juce::String(skipName(processor_.pdcLastSkip(static_cast<int>(i))));
+                const double ms = (sr > 0.0) ? (static_cast<double>(ov) / sr) * 1000.0 : 0.0;
+                txt += juce::String(ms, 2) + "ms";
             }
         }
         pdc_diag_label_.setText(txt, juce::dontSendNotification);
@@ -595,45 +559,20 @@ void HubEditor::timerCallback() {
 
     // Drive the calibration probe.
     processor_.finishCalibrationIfReady();
-    const auto cal       = processor_.lastCalibrationResult();
-    const auto solo_cali = processor_.soloCaliStatus();
-    const bool solo_in_progress =
-        solo_cali.state == HubProcessor::SoloCaliState::Capturing
-     || solo_cali.state == HubProcessor::SoloCaliState::Measuring;
+    const auto cal = processor_.lastCalibrationResult();
+    calibrate_button_.setEnabled(true);
 
-    if (processor_.calibrationInProgress() || solo_in_progress) {
+    // Inter-sat callback-alignment probe result (Green / Yellow / Red badge).
+    // The PDC auto-measurement was removed; per-row Latency fields are the
+    // only knob now.
+    if (processor_.calibrationInProgress()) {
         calibrate_badge_color_ = juce::Colours::lightgrey;
-        calibrate_button_.setEnabled(false);
-        if (solo_in_progress) {
-            calibrate_summary_.setText(
-                "Solo PDC: slot " + juce::String(solo_cali.current_slot)
-                + " (" + juce::String(solo_cali.completed_slots)
-                + "/" + juce::String(solo_cali.total_slots) + ")",
-                juce::dontSendNotification);
-            calibrate_detail_.setText(juce::String(solo_cali.message),
-                                       juce::dontSendNotification);
-        }
-    } else {
-        calibrate_button_.setEnabled(true);
-        if (solo_cali.state == HubProcessor::SoloCaliState::Done
-            || solo_cali.state == HubProcessor::SoloCaliState::Failed) {
-            calibrate_badge_color_ =
-                solo_cali.state == HubProcessor::SoloCaliState::Done
-                    ? juce::Colours::limegreen
-                    : juce::Colours::indianred;
-            calibrate_summary_.setText(
-                solo_cali.state == HubProcessor::SoloCaliState::Done
-                    ? "Solo PDC calibration complete"
-                    : "Solo PDC calibration failed",
-                juce::dontSendNotification);
-            calibrate_detail_.setText(juce::String(solo_cali.message),
-                                       juce::dontSendNotification);
-        } else if (cal.valid) {
-            calibrate_badge_color_ = cal.passed ? juce::Colours::limegreen
-                                                : juce::Colours::indianred;
-            calibrate_summary_.setText(juce::String(cal.summary), juce::dontSendNotification);
-            calibrate_detail_.setText(juce::String(cal.detail), juce::dontSendNotification);
-        }
+        calibrate_summary_.setText("Calibrating...", juce::dontSendNotification);
+    } else if (cal.valid) {
+        calibrate_badge_color_ = cal.passed ? juce::Colours::limegreen
+                                            : juce::Colours::indianred;
+        calibrate_summary_.setText(juce::String(cal.summary), juce::dontSendNotification);
+        calibrate_detail_.setText(juce::String(cal.detail), juce::dontSendNotification);
     }
 
     // Build the set of active slots; create rows on demand. Rows persist across
@@ -776,13 +715,10 @@ void HubEditor::timerCallback() {
 
         // Per-sat PDC state (auto-measured + user override + confidence).
         {
-            const auto m  = processor_.pdcDMeasured(s.slot_index);
             const auto ov = processor_.pdcDOverride(s.slot_index);
             row_ptr->setPdcState(
-                m  == HubProcessor::kPdcUnknown ? LayerRow::kPdcUnknown : static_cast<long long>(m),
                 ov == HubProcessor::kPdcUnknown ? LayerRow::kPdcUnknown : static_cast<long long>(ov),
-                processor_.getSampleRate(),
-                processor_.pdcConfidence(s.slot_index));
+                processor_.getSampleRate());
         }
 
         const auto rec_file = processor_.getLastRecordingForSlot(s.slot_index);

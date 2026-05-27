@@ -7,6 +7,7 @@
 //! plugin, no shared-memory transport, no topology constraints. See the
 //! migration plan for the PDC reasoning.
 
+mod adaptive;
 mod app;
 mod audio;
 mod export;

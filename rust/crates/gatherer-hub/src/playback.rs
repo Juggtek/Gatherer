@@ -16,7 +16,9 @@ const ENVELOPE_BUCKETS: usize = 1200;
 /// Decoded take: interleaved-stereo samples per recorded source, plus
 /// the MIDI grid state captured at the moment recording started (so the
 /// UI can draw bar lines over the waveforms). `time_sig_num` is the
-/// beats-per-bar in effect at the time of recording.
+/// beats-per-bar in effect at the time of recording. `armed[i]` is the
+/// user-side source index for `sources[i]` (so the playback callback can
+/// look up per-source params/normalization).
 pub struct PlaybackData {
     pub sources: Vec<Arc<Vec<f32>>>,
     pub len_frames: usize,
@@ -26,6 +28,7 @@ pub struct PlaybackData {
     /// timeline display uses the live UI meter so it can be corrected).
     #[allow(dead_code)]
     pub time_sig_num: u32,
+    pub armed: Vec<usize>,
 }
 
 /// Shared transport + buffers between UI (control + load) and audio (read).
@@ -145,6 +148,7 @@ pub fn load_take(
             start_pulses,
             bpm,
             time_sig_num: time_sig_num.max(1),
+            armed: sources.to_vec(),
         },
         envs,
     ))
@@ -200,6 +204,7 @@ mod tests {
             start_pulses: 0,
             bpm: 0.0,
             time_sig_num: 4,
+            armed: vec![0],
         });
         assert!(pb.has_take());
         pb.play();

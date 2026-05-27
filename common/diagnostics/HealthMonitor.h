@@ -171,13 +171,15 @@ private:
 
         if (live.size() > 1 && (max_rate - min_rate) > rate_tol) {
             current_ = {
-                HealthLevel::Red,
+                HealthLevel::Yellow,
                 "Satellites called at different rates",
                 fmt("Slot %d runs %.0f/s, slot %d runs %.0f/s. ",
                     fastest, max_rate, slowest, min_rate) +
-                "Reaper anticipative FX or parallel-track scheduling. "
-                "Move the hub onto a parent group/bus track so all satellites "
-                "are upstream of it." + ghost_hint};
+                "Common causes: per-track clip-gating (Bitwig only calls "
+                "processBlock on tracks with an active clip at the playhead), "
+                "host pre-rolling for PDC, or parallel-track scheduling. "
+                "Per-track PDC offsets compensate for this; recordings should "
+                "still align." + ghost_hint};
             return;
         }
 

@@ -234,17 +234,38 @@ impl AudioEngine {
                     let mut mpk_l = 0f32;
                     let mut mpk_r = 0f32;
 
+                    let any_solo = if take.is_some() {
+                        params_out.any_soloed()
+                    } else {
+                        false
+                    };
                     for f in 0..frames {
                         let (mut l, mut r) = (0.0f32, 0.0f32);
                         match &take {
                             Some(d) => {
                                 if pos < d.len_frames {
                                     let idx = pos * 2;
-                                    for src in &d.sources {
-                                        if idx + 1 < src.len() {
-                                            l += src[idx];
-                                            r += src[idx + 1];
+                                    for (i, src) in d.sources.iter().enumerate() {
+                                        if idx + 1 >= src.len() {
+                                            continue;
                                         }
+                                        let src_idx = d.armed.get(i).copied().unwrap_or(i);
+                                        let Some(sp) = params_out.sources.get(src_idx) else {
+                                            continue;
+                                        };
+                                        if sp.is_muted() || (any_solo && !sp.is_soloed()) {
+                                            continue;
+                                        }
+                                        let mixer_g = sp.load_gain();
+                                        let sign = if sp.is_inverted() { -1.0 } else { 1.0 };
+                                        let norm_g = params_out
+                                            .normalization_gains
+                                            .get(src_idx)
+                                            .map(|a| a.load(Ordering::Relaxed))
+                                            .unwrap_or(1.0);
+                                        let g = mixer_g * norm_g * sign;
+                                        l += src[idx] * g;
+                                        r += src[idx + 1] * g;
                                     }
                                     pos += 1;
                                 } else {

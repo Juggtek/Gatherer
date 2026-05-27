@@ -137,11 +137,11 @@ LayerRow::LayerRow() {
     pdc_label_.setColour(juce::Label::backgroundWhenEditingColourId,
                          juce::Colours::black.withAlpha(0.6f));
     pdc_label_.setColour(juce::Label::textWhenEditingColourId, juce::Colours::white);
-    pdc_label_.setText("Latency: -", juce::dontSendNotification);
-    pdc_label_.setTooltip("Per-track latency offset (ms). Auto-measured by cross-"
-                          "correlating this sat's audio against the hub's input. "
-                          "Click to edit and override (e.g. if your DAW reports a "
-                          "known per-track latency). Type 'auto' or blank to clear.");
+    pdc_label_.setText("Latency: -  (click to set)", juce::dontSendNotification);
+    pdc_label_.setTooltip("Per-track latency offset (ms). Type the value your DAW "
+                          "reports for this track in its track-inspector / latency "
+                          "field. Hub adds that delay when reading this sat's audio. "
+                          "Type 'auto', '0', or blank to clear.");
     pdc_label_.onTextChange = [this] {
         const auto txt = pdc_label_.getText().trim().toLowerCase();
         if (! onPdcOverrideChanged) { updatePdcLabel(); return; }
@@ -239,41 +239,23 @@ void LayerRow::setLufs(float integrated, float momentary, float short_term) {
     }
 }
 
-void LayerRow::setPdcState(long long measured_samples, long long override_samples,
-                            double sample_rate, float confidence) {
-    if (measured_samples == pdc_measured_samples_
-        && override_samples == pdc_override_samples_
-        && sample_rate == pdc_sample_rate_
-        && std::abs(confidence - pdc_confidence_) < 1e-3f) return;
-    pdc_measured_samples_ = measured_samples;
+void LayerRow::setPdcState(long long override_samples, double sample_rate) {
+    if (override_samples == pdc_override_samples_
+        && sample_rate == pdc_sample_rate_) return;
     pdc_override_samples_ = override_samples;
     pdc_sample_rate_      = sample_rate;
-    pdc_confidence_       = confidence;
     updatePdcLabel();
 }
 
 void LayerRow::updatePdcLabel() {
     if (pdc_label_.isBeingEdited()) return;  // don't clobber the user's typing
-    const bool   has_override = (pdc_override_samples_ != kPdcUnknown);
-    const long long shown_samp = has_override ? pdc_override_samples_ : pdc_measured_samples_;
-    if (shown_samp == kPdcUnknown || pdc_sample_rate_ <= 0.0) {
-        pdc_label_.setText(has_override ? "Latency: (override blank)" : "Latency: -",
-                            juce::dontSendNotification);
+    if (pdc_override_samples_ == kPdcUnknown || pdc_sample_rate_ <= 0.0) {
+        pdc_label_.setText("Latency: -  (click to set)", juce::dontSendNotification);
         return;
     }
-    const double ms = (static_cast<double>(shown_samp) / pdc_sample_rate_) * 1000.0;
-    juce::String txt = "Latency: " + juce::String(ms, 2) + " ms";
-    if (has_override) {
-        txt += "  (manual)";
-    } else {
-        // Auto-measured. Annotate with reliability. Threshold matches
-        // HubProcessor::kPdcMinConfidence (= 0.70) — below this, the
-        // value is NOT applied to recordings; user should set a manual
-        // override if they want compensation on this track.
-        if (pdc_confidence_ >= 0.70f)        txt += "  (auto, applied)";
-        else                                 txt += "  (auto, noisy — not applied)";
-    }
-    pdc_label_.setText(txt, juce::dontSendNotification);
+    const double ms = (static_cast<double>(pdc_override_samples_) / pdc_sample_rate_) * 1000.0;
+    pdc_label_.setText("Latency: " + juce::String(ms, 2) + " ms  (manual)",
+                        juce::dontSendNotification);
 }
 
 void LayerRow::setMixState(bool mute, bool solo, bool record_arm,
