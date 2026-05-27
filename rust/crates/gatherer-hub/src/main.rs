@@ -9,6 +9,7 @@
 
 mod app;
 mod audio;
+mod midi;
 mod params;
 mod playback;
 mod recording;

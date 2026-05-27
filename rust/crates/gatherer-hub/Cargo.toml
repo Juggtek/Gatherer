@@ -23,3 +23,6 @@ rtrb = "0.3"
 hound = "3"
 # Lock-free Arc swap — publish loaded playback buffers UI → audio thread.
 arc-swap = "1"
+# MIDI input (Clock/transport sync from the DAW). Virtual input port on
+# macOS/Linux; the hub appears as a MIDI destination called "Gatherer Hub".
+midir = "0.10"

@@ -6,6 +6,7 @@
 //! widgets for now; FIELD's canvas meters/faders are a later polish pass.
 
 use crate::audio::{self, AudioEngine};
+use crate::midi::{self, MidiSync};
 use crate::params::{linear_to_db, HubParams, GAIN_DB_MAX, GAIN_DB_MIN};
 use crate::playback::Playback;
 use crate::recording::{RecordState, RecorderControl};
@@ -55,6 +56,7 @@ pub struct State {
     engine: Option<AudioEngine>,
     recorder: Option<RecorderControl>,
     playback: Arc<Playback>,
+    midi: Option<MidiSync>,
     num_sources: usize,
     error: Option<String>,
 
@@ -86,6 +88,9 @@ impl State {
             engine: None,
             recorder: None,
             playback: Playback::new(),
+            midi: midi::start("Gatherer Hub")
+                .map_err(|e| eprintln!("gatherer-hub: MIDI sync disabled: {e}"))
+                .ok(),
             num_sources: 0,
             error: None,
             source_peaks_db: Vec::new(),
@@ -274,6 +279,9 @@ impl State {
             body = body.push(text(format!("audio error: {err}")).size(13));
         }
 
+        // MIDI sync status (route your DAW's MIDI clock to "Gatherer Hub").
+        body = body.push(text(midi_status_line(self.midi.as_ref())).size(13));
+
         // Master row.
         body = body.push(Space::with_height(6));
         body = body.push(
@@ -434,6 +442,26 @@ fn device_names(devices: Option<impl Iterator<Item = cpal::Device>>) -> Vec<Stri
     devices
         .map(|it| it.filter_map(|d| d.name().ok()).collect())
         .unwrap_or_default()
+}
+
+fn midi_status_line(midi: Option<&MidiSync>) -> String {
+    let Some(m) = midi else {
+        return "MIDI: unavailable".to_string();
+    };
+    let s = &m.state;
+    if !s.connected() {
+        return "MIDI: waiting \u{2014} route your DAW's MIDI clock to \"Gatherer Hub\""
+            .to_string();
+    }
+    let bpm = s.bpm();
+    let bpm_str = if bpm > 0.0 {
+        format!("{bpm:>5.1} BPM")
+    } else {
+        "---.- BPM".to_string()
+    };
+    let (bar, beat) = s.bar_beat();
+    let xport = if s.playing() { "\u{25B6}" } else { "\u{25A0}" };
+    format!("MIDI {xport}  {bpm_str}   bar {bar} : beat {beat}")
 }
 
 /// A recorded source's waveform: peak envelope (filled) + a playhead line.
