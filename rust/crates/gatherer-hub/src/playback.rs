@@ -13,10 +13,14 @@ use std::sync::Arc;
 /// Waveform display resolution (peak buckets per source).
 const ENVELOPE_BUCKETS: usize = 1200;
 
-/// Decoded take: interleaved-stereo samples per recorded source.
+/// Decoded take: interleaved-stereo samples per recorded source, plus
+/// the MIDI grid state captured at the moment recording started (so the
+/// UI can draw bar lines over the waveforms).
 pub struct PlaybackData {
     pub sources: Vec<Arc<Vec<f32>>>,
     pub len_frames: usize,
+    pub start_pulses: u64,
+    pub bpm: f32,
 }
 
 /// Shared transport + buffers between UI (control + load) and audio (read).
@@ -101,6 +105,8 @@ impl Playback {
 pub fn load_take(
     dir: &Path,
     sources: &[usize],
+    start_pulses: u64,
+    bpm: f32,
 ) -> Result<(PlaybackData, Vec<(usize, Vec<f32>)>), String> {
     let mut bufs = Vec::with_capacity(sources.len());
     let mut envs = Vec::with_capacity(sources.len());
@@ -120,6 +126,8 @@ pub fn load_take(
         PlaybackData {
             sources: bufs,
             len_frames: max_len,
+            start_pulses,
+            bpm,
         },
         envs,
     ))
@@ -172,6 +180,8 @@ mod tests {
         pb.set_take(PlaybackData {
             sources: vec![Arc::new(vec![0.0; 100 * 2])],
             len_frames: 100,
+            start_pulses: 0,
+            bpm: 0.0,
         });
         assert!(pb.has_take());
         pb.play();

@@ -6,7 +6,7 @@
 //! widgets for now; FIELD's canvas meters/faders are a later polish pass.
 
 use crate::audio::{self, AudioEngine};
-use crate::midi::{self, MidiSync};
+use crate::midi::{self, MidiSync, BEATS_PER_BAR, PPQN};
 use crate::params::{linear_to_db, HubParams, GAIN_DB_MAX, GAIN_DB_MIN};
 use crate::playback::Playback;
 use crate::recording::{RecordState, RecorderControl};
@@ -19,6 +19,8 @@ use iced::{
     mouse, Alignment, Color, Element, Length, Point, Rectangle, Renderer, Size, Subscription,
     Task, Theme,
 };
+use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -64,11 +66,15 @@ pub struct State {
     source_peaks_db: Vec<f32>,
     master_peak_db: f32,
     master_gain_db: f32,
-    /// Per recorded source: (source index, peak envelope) for the waveform.
-    waveforms: Vec<(usize, Vec<f32>)>,
+    /// Static loaded envelope per source index (populated after Stop + load).
+    waveforms: HashMap<usize, Vec<f32>>,
     /// Set when recording stops; the take is loaded once the writer thread
     /// has had time to finalize the WAV files.
     pending_load_at: Option<Instant>,
+    /// MIDI grid snapshot at record-start, used to align bar lines on the
+    /// resulting waveforms.
+    take_start_pulses: u64,
+    take_start_bpm: f32,
 }
 
 impl State {
@@ -96,8 +102,10 @@ impl State {
             source_peaks_db: Vec::new(),
             master_peak_db: METER_FLOOR_DB,
             master_gain_db: 0.0,
-            waveforms: Vec::new(),
+            waveforms: HashMap::new(),
             pending_load_at: None,
+            take_start_pulses: 0,
+            take_start_bpm: 0.0,
         };
         state.restart_engine();
         state
@@ -187,15 +195,32 @@ impl State {
             }
             Message::ToggleRecord => {
                 let sr = self.engine.as_ref().map(|e| e.sample_rate as u32).unwrap_or(48000);
-                let stopped = if let Some(r) = self.recorder.as_mut() {
+                let (was, now) = if let Some(r) = self.recorder.as_mut() {
                     let was = r.recording;
                     r.toggle(sr);
-                    was && !r.recording
+                    (was, r.recording)
                 } else {
-                    false
+                    (false, false)
                 };
-                if stopped {
-                    // Load the take once the writer thread has finalized the WAVs.
+                if !was && now {
+                    // Snapshot MIDI grid for bar alignment, pause playback,
+                    // and clear the previous loaded waveforms — the live
+                    // preview now feeds the lanes.
+                    self.take_start_pulses = self
+                        .midi
+                        .as_ref()
+                        .map(|m| m.state.pulses())
+                        .unwrap_or(0);
+                    self.take_start_bpm = self
+                        .midi
+                        .as_ref()
+                        .map(|m| m.state.bpm())
+                        .unwrap_or(0.0);
+                    self.playback.pause();
+                    self.waveforms.clear();
+                }
+                if was && !now {
+                    // Load the take once the writer thread finalizes the WAVs.
                     self.pending_load_at = Some(Instant::now());
                 }
             }
@@ -242,10 +267,11 @@ impl State {
         if armed.is_empty() {
             return;
         }
-        match crate::playback::load_take(&dir, &armed) {
+        match crate::playback::load_take(&dir, &armed, self.take_start_pulses, self.take_start_bpm)
+        {
             Ok((data, envs)) => {
                 self.playback.set_take(data);
-                self.waveforms = envs;
+                self.waveforms = envs.into_iter().collect();
             }
             Err(e) => self.error = Some(format!("load take: {e}")),
         }
@@ -347,13 +373,54 @@ impl State {
         for i in 0..self.num_sources {
             rows = rows.push(self.source_row(i));
         }
-        if !self.waveforms.is_empty() {
+        if self.num_sources > 0 {
             rows = rows.push(Space::with_height(8));
             rows = rows.push(text("Recorded take").size(14));
-            let frac = self.playback.fraction();
-            for (idx, env) in &self.waveforms {
-                rows = rows.push(text(format!("Src {}", idx + 1)).size(11));
-                rows = rows.push(waveform_lane(env, frac));
+
+            let recording = self.recorder.as_ref().map(|r| r.recording).unwrap_or(false);
+            let preview = self.recorder.as_ref().and_then(|r| r.last_preview.as_ref());
+
+            // Lane time-extent + grid info.
+            let (len_seconds, take_pulses, take_bpm) = if recording {
+                let elapsed = preview
+                    .map(|p| {
+                        p.sources
+                            .iter()
+                            .map(|s| {
+                                let n = s.current_bucket.load(Ordering::Relaxed);
+                                n as f32 * (p.samples_per_bucket as f32 / 2.0)
+                                    / p.sample_rate as f32
+                            })
+                            .fold(0.0f32, f32::max)
+                    })
+                    .unwrap_or(0.0);
+                let bpm = self.midi.as_ref().map(|m| m.state.bpm()).unwrap_or(0.0);
+                (elapsed, self.take_start_pulses, bpm)
+            } else if self.playback.has_take() {
+                let sr = self.engine.as_ref().map(|e| e.sample_rate).unwrap_or(48_000.0);
+                self.playback
+                    .snapshot()
+                    .map(|d| (d.len_frames as f32 / sr, d.start_pulses, d.bpm))
+                    .unwrap_or((0.0, 0, 0.0))
+            } else {
+                (0.0, 0, 0.0)
+            };
+
+            let bar_lines = bar_fractions(take_pulses, take_bpm, len_seconds);
+            let playhead = if !recording && self.playback.has_take() {
+                Some(self.playback.fraction())
+            } else {
+                None
+            };
+
+            for i in 0..self.num_sources {
+                let env: Vec<f32> = if recording {
+                    preview.map(|p| p.snapshot(i)).unwrap_or_default()
+                } else {
+                    self.waveforms.get(&i).cloned().unwrap_or_default()
+                };
+                rows = rows.push(text(format!("Src {}", i + 1)).size(11));
+                rows = rows.push(waveform_lane(env, playhead, bar_lines.clone()));
             }
         }
         body = body.push(scrollable(rows).height(Length::Fill));
@@ -464,13 +531,16 @@ fn midi_status_line(midi: Option<&MidiSync>) -> String {
     format!("MIDI {xport}  {bpm_str}   bar {bar} : beat {beat}")
 }
 
-/// A recorded source's waveform: peak envelope (filled) + a playhead line.
-struct Waveform<'a> {
-    env: &'a [f32],
-    playhead: f32,
+/// A recorded source's waveform: peak envelope + optional playhead +
+/// bar-grid verticals (positions are 0..1 fractions of the lane width).
+/// Owns its data so the iced `Element` doesn't borrow from `State`.
+struct Waveform {
+    env: Vec<f32>,
+    playhead: Option<f32>,
+    bar_lines: Vec<f32>,
 }
 
-impl canvas::Program<Message> for Waveform<'_> {
+impl canvas::Program<Message> for Waveform {
     type State = ();
 
     fn draw(
@@ -497,34 +567,117 @@ impl canvas::Program<Message> for Waveform<'_> {
             Color::from_rgb(0.25, 0.26, 0.30),
         );
 
-        let n = self.env.len().max(1);
-        let col_w = (w / n as f32).max(1.0);
-        // Normalize to the take's loudest peak so quiet recordings still
-        // fill the lane (a display scaling, not a level readout).
-        let max = self.env.iter().cloned().fold(1e-6_f32, f32::max);
-        let wave = Color::from_rgb(0.45, 0.72, 1.0);
-        for (i, &amp) in self.env.iter().enumerate() {
-            let half = (amp / max).clamp(0.0, 1.0) * mid;
-            let x = i as f32 / n as f32 * w;
-            let bar_h = (half * 2.0).max(1.0); // keep a 1px sliver at silence
-            frame.fill_rectangle(Point::new(x, mid - half), Size::new(col_w, bar_h), wave);
+        // Bar grid lines (faint vertical strokes).
+        let grid_color = Color::from_rgb(0.40, 0.40, 0.46);
+        for &frac in &self.bar_lines {
+            let x = frac.clamp(0.0, 1.0) * w;
+            frame.stroke(
+                &canvas::Path::line(Point::new(x, 0.0), Point::new(x, h)),
+                canvas::Stroke::default().with_color(grid_color).with_width(1.0),
+            );
         }
 
-        let px = self.playhead.clamp(0.0, 1.0) * w;
-        frame.stroke(
-            &canvas::Path::line(Point::new(px, 0.0), Point::new(px, h)),
-            canvas::Stroke::default()
-                .with_color(Color::from_rgb(1.0, 0.85, 0.3))
-                .with_width(1.5),
-        );
+        // Waveform bars (normalized to the take's loudest peak so quiet
+        // recordings still fill the lane).
+        let n = self.env.len();
+        if n > 0 {
+            let col_w = (w / n as f32).max(1.0);
+            let max = self.env.iter().cloned().fold(1e-6_f32, f32::max);
+            let wave = Color::from_rgb(0.45, 0.72, 1.0);
+            for (i, &amp) in self.env.iter().enumerate() {
+                let half = (amp / max).clamp(0.0, 1.0) * mid;
+                let x = i as f32 / n as f32 * w;
+                let bar_h = (half * 2.0).max(1.0);
+                frame.fill_rectangle(Point::new(x, mid - half), Size::new(col_w, bar_h), wave);
+            }
+        }
+
+        // Playhead (only while a loaded take is being played).
+        if let Some(p) = self.playhead {
+            let px = p.clamp(0.0, 1.0) * w;
+            frame.stroke(
+                &canvas::Path::line(Point::new(px, 0.0), Point::new(px, h)),
+                canvas::Stroke::default()
+                    .with_color(Color::from_rgb(1.0, 0.85, 0.3))
+                    .with_width(1.5),
+            );
+        }
 
         vec![frame.into_geometry()]
     }
 }
 
-fn waveform_lane(env: &[f32], playhead: f32) -> Element<'_, Message> {
-    canvas(Waveform { env, playhead })
-        .width(Length::Fill)
-        .height(Length::Fixed(56.0))
-        .into()
+fn waveform_lane(
+    env: Vec<f32>,
+    playhead: Option<f32>,
+    bar_lines: Vec<f32>,
+) -> Element<'static, Message> {
+    canvas(Waveform {
+        env,
+        playhead,
+        bar_lines,
+    })
+    .width(Length::Fill)
+    .height(Length::Fixed(56.0))
+    .into()
+}
+
+/// Positions (0..1 fractions of `len_seconds`) where bar boundaries fall
+/// for a take that started at MIDI pulse `start_pulses` at `bpm`. Empty
+/// when MIDI sync isn't running (bpm == 0) or the lane has no duration.
+fn bar_fractions(start_pulses: u64, bpm: f32, len_seconds: f32) -> Vec<f32> {
+    if bpm <= 0.0 || len_seconds <= 0.0 {
+        return Vec::new();
+    }
+    let bar_seconds = 60.0 / bpm * BEATS_PER_BAR as f32;
+    let pulses_per_bar = (PPQN * BEATS_PER_BAR) as u64;
+    let phase_pulses = start_pulses % pulses_per_bar;
+    let phase_seconds = phase_pulses as f32 / PPQN as f32 * (60.0 / bpm);
+    let first = if phase_seconds > 1e-3 {
+        bar_seconds - phase_seconds
+    } else {
+        0.0
+    };
+    let mut out = Vec::new();
+    let mut t = first;
+    while t < len_seconds {
+        if t >= 0.0 {
+            out.push(t / len_seconds);
+        }
+        t += bar_seconds;
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bar_fractions_120bpm_aligned() {
+        // 4/4 at 120 BPM → bar_seconds = 2.0 → bars at 0,2,4,6 over 8 s.
+        let f = bar_fractions(0, 120.0, 8.0);
+        assert_eq!(f.len(), 4);
+        assert!((f[0] - 0.0).abs() < 1e-6);
+        assert!((f[1] - 0.25).abs() < 1e-6);
+        assert!((f[2] - 0.50).abs() < 1e-6);
+        assert!((f[3] - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn bar_fractions_120bpm_midbar_start() {
+        // Started 2 beats into a 4/4 bar (48 pulses) → first bar line at 1 s.
+        let f = bar_fractions(48, 120.0, 8.0);
+        assert_eq!(f.len(), 4);
+        assert!((f[0] - 0.125).abs() < 1e-6);
+        assert!((f[1] - 0.375).abs() < 1e-6);
+        assert!((f[2] - 0.625).abs() < 1e-6);
+        assert!((f[3] - 0.875).abs() < 1e-6);
+    }
+
+    #[test]
+    fn bar_fractions_empty_without_sync_or_length() {
+        assert!(bar_fractions(0, 0.0, 8.0).is_empty());
+        assert!(bar_fractions(0, 120.0, 0.0).is_empty());
+    }
 }

@@ -15,11 +15,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// 24 MIDI Clock pulses per quarter note (standard).
-const PPQN: u32 = 24;
+pub const PPQN: u32 = 24;
 /// Smooth BPM over one beat of clock pulses.
 const SMOOTH_PULSES: usize = PPQN as usize;
 /// v1 assumption — time-signature controls come later.
-const BEATS_PER_BAR: u32 = 4;
+pub const BEATS_PER_BAR: u32 = 4;
 
 pub struct GridState {
     bpm: AtomicF32,

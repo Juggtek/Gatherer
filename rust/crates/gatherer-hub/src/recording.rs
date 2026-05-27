@@ -6,15 +6,22 @@
 //! Recording captures the **raw** per-source input (pre gain/mute/solo/
 //! invert) — those are monitoring controls, not part of the captured take.
 
+use atomic_float::AtomicF32;
 use rtrb::{Consumer, Producer};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// ~1.36 s of stereo slack per source @ 48 k — absorbs writer scheduling.
 const REC_RING_FRAMES: usize = 1 << 16;
+
+/// Live-preview envelope: mono samples per bucket (= ½ that many stereo
+/// frames). 4800 samples = 50 ms @ 48 k.
+const PREVIEW_SAMPLES_PER_BUCKET: u32 = 4800;
+/// 8192 buckets × 50 ms = ~6.8 min cap for the live preview.
+const PREVIEW_MAX_BUCKETS: usize = 8192;
 
 type Wav = hound::WavWriter<std::io::BufWriter<std::fs::File>>;
 
@@ -61,8 +68,66 @@ pub enum WriterCommand {
         dir: PathBuf,
         armed: Vec<usize>,
         sample_rate: u32,
+        /// Shared live envelope the writer fills as it drains. UI reads it
+        /// each tick to draw the growing waveform during recording.
+        preview: Arc<RecordingPreview>,
     },
     Stop,
+}
+
+/// One source's live envelope. Writer thread (single writer per source)
+/// stores peak per bucket; UI loads atomics each tick.
+pub struct PreviewSource {
+    pub source_idx: usize,
+    pub envelope: Vec<AtomicF32>,
+    pub current_bucket: AtomicUsize,
+}
+
+/// Shared live preview of an in-progress recording.
+pub struct RecordingPreview {
+    pub sources: Vec<PreviewSource>,
+    pub sample_rate: u32,
+    pub samples_per_bucket: u32,
+}
+
+impl RecordingPreview {
+    pub fn new(armed: &[usize], sample_rate: u32) -> Arc<Self> {
+        let sources = armed
+            .iter()
+            .map(|&idx| PreviewSource {
+                source_idx: idx,
+                envelope: (0..PREVIEW_MAX_BUCKETS)
+                    .map(|_| AtomicF32::new(0.0))
+                    .collect(),
+                current_bucket: AtomicUsize::new(0),
+            })
+            .collect();
+        Arc::new(Self {
+            sources,
+            sample_rate,
+            samples_per_bucket: PREVIEW_SAMPLES_PER_BUCKET,
+        })
+    }
+
+    /// Loaded-as-Vec snapshot of one source's filled buckets (UI helper).
+    pub fn snapshot(&self, source_idx: usize) -> Vec<f32> {
+        let Some(src) = self.sources.iter().find(|s| s.source_idx == source_idx) else {
+            return Vec::new();
+        };
+        let n = src.current_bucket.load(Ordering::Relaxed).min(src.envelope.len());
+        src.envelope[..n].iter().map(|a| a.load(Ordering::Relaxed)).collect()
+    }
+
+    /// Seconds elapsed for `source_idx` (bucket count × bucket duration).
+    #[allow(dead_code)] // public helper; the UI currently inlines the math
+    pub fn elapsed_seconds(&self, source_idx: usize) -> f32 {
+        let Some(src) = self.sources.iter().find(|s| s.source_idx == source_idx) else {
+            return 0.0;
+        };
+        let n = src.current_bucket.load(Ordering::Relaxed);
+        // mono samples / 2 = stereo frames; / sample_rate = seconds
+        n as f32 * (self.samples_per_bucket as f32 / 2.0) / self.sample_rate as f32
+    }
 }
 
 /// UI-side handle: arm flags + start/stop. One per engine instance (the
@@ -76,6 +141,8 @@ pub struct RecorderControl {
     /// Source indices captured in the last/current session (for loading the
     /// take back for playback + waveform display).
     pub last_armed: Vec<usize>,
+    /// Live envelope of the current/last session — UI reads atomics each tick.
+    pub last_preview: Option<Arc<RecordingPreview>>,
     pub error: Option<String>,
 }
 
@@ -87,6 +154,7 @@ impl RecorderControl {
             recording: false,
             last_session: None,
             last_armed: Vec::new(),
+            last_preview: None,
             error: None,
         }
     }
@@ -115,10 +183,17 @@ impl RecorderControl {
             }
         };
         self.last_armed = armed.clone();
+        let preview = RecordingPreview::new(&armed, sample_rate);
+        self.last_preview = Some(preview.clone());
         self.state.set_active(true);
         if self
             .tx
-            .send(WriterCommand::Start { dir: dir.clone(), armed, sample_rate })
+            .send(WriterCommand::Start {
+                dir: dir.clone(),
+                armed,
+                sample_rate,
+                preview,
+            })
             .is_err()
         {
             self.state.set_active(false);
@@ -154,12 +229,16 @@ pub fn make_rings(num_sources: usize) -> (Vec<Producer<f32>>, Vec<Consumer<f32>>
 /// (its `RecorderControl` dropped on engine teardown) — draining and
 /// finalizing any open files first.
 pub fn writer_loop(mut consumers: Vec<Consumer<f32>>, cmd_rx: Receiver<WriterCommand>) {
-    let mut writers: Vec<Option<Wav>> = (0..consumers.len()).map(|_| None).collect();
+    let n = consumers.len();
+    let mut writers: Vec<Option<Wav>> = (0..n).map(|_| None).collect();
+    let mut acc_peak: Vec<f32> = vec![0.0; n];
+    let mut acc_samples: Vec<u32> = vec![0; n];
+    let mut preview: Option<Arc<RecordingPreview>> = None;
     let mut recording = false;
 
     loop {
         match cmd_rx.recv_timeout(Duration::from_millis(5)) {
-            Ok(WriterCommand::Start { dir, armed, sample_rate }) => {
+            Ok(WriterCommand::Start { dir, armed, sample_rate, preview: p }) => {
                 let spec = hound::WavSpec {
                     channels: 2,
                     sample_rate,
@@ -176,36 +255,67 @@ pub fn writer_loop(mut consumers: Vec<Consumer<f32>>, cmd_rx: Receiver<WriterCom
                         Err(e) => eprintln!("recorder: create {}: {e}", path.display()),
                     }
                 }
+                for v in acc_peak.iter_mut() {
+                    *v = 0.0;
+                }
+                for v in acc_samples.iter_mut() {
+                    *v = 0;
+                }
+                preview = Some(p);
                 recording = true;
             }
             Ok(WriterCommand::Stop) => {
-                drain(&mut consumers, &mut writers);
+                drain(&mut consumers, &mut writers, preview.as_deref(), &mut acc_peak, &mut acc_samples);
                 // Catch a trailing block the audio thread may have pushed
                 // after it observed active=false.
                 std::thread::sleep(Duration::from_millis(20));
-                drain(&mut consumers, &mut writers);
+                drain(&mut consumers, &mut writers, preview.as_deref(), &mut acc_peak, &mut acc_samples);
                 finalize(&mut writers);
+                preview = None;
                 recording = false;
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
-                drain(&mut consumers, &mut writers);
+                drain(&mut consumers, &mut writers, preview.as_deref(), &mut acc_peak, &mut acc_samples);
                 finalize(&mut writers);
                 break;
             }
         }
         if recording {
-            drain(&mut consumers, &mut writers);
+            drain(&mut consumers, &mut writers, preview.as_deref(), &mut acc_peak, &mut acc_samples);
         }
     }
 }
 
-fn drain(consumers: &mut [Consumer<f32>], writers: &mut [Option<Wav>]) {
-    for (c, w) in consumers.iter_mut().zip(writers.iter_mut()) {
+fn drain(
+    consumers: &mut [Consumer<f32>],
+    writers: &mut [Option<Wav>],
+    preview: Option<&RecordingPreview>,
+    acc_peak: &mut [f32],
+    acc_samples: &mut [u32],
+) {
+    let spb = preview.map(|p| p.samples_per_bucket).unwrap_or(u32::MAX);
+    for (s, (c, w)) in consumers.iter_mut().zip(writers.iter_mut()).enumerate() {
         if let Some(writer) = w {
+            let ps = preview.and_then(|p| p.sources.iter().find(|ps| ps.source_idx == s));
+            let cap = ps.map(|p| p.envelope.len()).unwrap_or(0);
             while let Ok(sample) = c.pop() {
                 if writer.write_sample(sample).is_err() {
                     break;
+                }
+                if let Some(ps) = ps {
+                    let bucket = ps.current_bucket.load(Ordering::Relaxed);
+                    if bucket < cap {
+                        acc_peak[s] = acc_peak[s].max(sample.abs());
+                        acc_samples[s] += 1;
+                        if acc_samples[s] >= spb {
+                            // Single writer per source for this bucket; non-decreasing.
+                            ps.envelope[bucket].store(acc_peak[s], Ordering::Relaxed);
+                            ps.current_bucket.store(bucket + 1, Ordering::Relaxed);
+                            acc_peak[s] = 0.0;
+                            acc_samples[s] = 0;
+                        }
+                    }
                 }
             }
         }
@@ -261,6 +371,7 @@ mod tests {
             dir: dir.clone(),
             armed: vec![0],
             sample_rate: 48_000,
+            preview: RecordingPreview::new(&[0], 48_000),
         })
         .unwrap();
         std::thread::sleep(Duration::from_millis(30)); // let the file open
