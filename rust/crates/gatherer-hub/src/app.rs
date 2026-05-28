@@ -109,6 +109,9 @@ pub enum Message {
     SetExitBars(u32),
     /// Remove all in/out regions from the active section.
     ClearRegions,
+    // ── Phase F: asset bundle I/O ──────────────────────────────────
+    SaveAsset,
+    ImportAsset,
     Tick,
 }
 
@@ -181,6 +184,10 @@ pub struct State {
 
     /// "Generate exits every N bars" parameter (Phase C). Default 2 bars.
     exit_bars: u32,
+    /// Asset bundle metadata (production code / variant / asset name) for
+    /// Save-as-Asset. Authored properly in B1; for now defaults + derived
+    /// from the session name on export.
+    asset_meta: crate::navigator::model::AssetMeta,
     /// Active adaptive section. Recording, playback, and waveforms all
     /// target this section's `recording/<slug>/` folder. (Phase B0; the
     /// full project tree is authored in B1.)
@@ -262,6 +269,7 @@ impl State {
             adaptive: AdaptiveMixer::new(),
             target_curve_popover_open: false,
             exit_bars: 2,
+            asset_meta: crate::navigator::model::AssetMeta::default(),
             current_section: SectionKind::Main,
             section_takes: HashMap::new(),
             section_cache: HashMap::new(),
@@ -693,6 +701,8 @@ impl State {
                     t.out_regions.clear();
                 }
             }
+            Message::SaveAsset => self.do_save_asset(),
+            Message::ImportAsset => self.do_import_asset(),
             Message::Tick => {
                 self.refresh_meters();
                 if let Some(t) = self.pending_load_at {
@@ -803,6 +813,237 @@ impl State {
             return None;
         }
         Some(crate::playback::AdaptiveProgram { geometry, audio })
+    }
+
+    /// Decoded per-source audio for a section (cache hit, else disk).
+    fn section_pcm(&self, kind: SectionKind) -> Option<crate::playback::PlaybackData> {
+        if let Some(c) = self.section_cache.get(&kind) {
+            return Some(c.data.clone());
+        }
+        let take = self.section_takes.get(&kind)?;
+        let session_root = self.session_root()?;
+        let dir = crate::recording::recording_dir(&session_root, kind.slug());
+        crate::playback::load_take(&dir, &take.armed, take.start_pulses, take.bpm, take.time_sig)
+            .ok()
+            .map(|(data, _)| data)
+    }
+
+    /// Save the current project as a `<CODE> - <Variant>_TT/` bundle:
+    /// `.ttasset` (mixer recipe) + `.wlamodel` (section graph) +
+    /// `.wlabank` (Ogg-encoded section mix + per-layer stems).
+    fn do_save_asset(&mut self) {
+        use crate::asset::{ogg, ttasset, wlabank, wlamodel};
+        use crate::navigator::model::AssetMeta;
+
+        // Resolve production code + variant (derive from session name).
+        let code = if !self.asset_meta.production_code.trim().is_empty() {
+            self.asset_meta.production_code.trim().to_string()
+        } else if !self.session_name.trim().is_empty() {
+            self.session_name.trim().to_string()
+        } else {
+            self.session_status = Some("set a session name or production code first".into());
+            return;
+        };
+        let variant = if self.asset_meta.variant_name.trim().is_empty() {
+            code.clone()
+        } else {
+            self.asset_meta.variant_name.trim().to_string()
+        };
+        let meta = AssetMeta {
+            production_code: code.clone(),
+            variant_name: variant.clone(),
+            asset_name: variant.clone(),
+            asset_type: crate::navigator::model::AssetType::Music,
+            description: self.asset_meta.description.clone(),
+            tags: self.asset_meta.tags.clone(),
+        };
+        let Some(session_root) = self.session_root() else {
+            self.session_status = Some("no session folder yet".into());
+            return;
+        };
+        let bundle_dir = session_root.join(format!("{code} - {variant}_TT"));
+        if let Err(e) = std::fs::create_dir_all(&bundle_dir) {
+            self.session_status = Some(format!("create bundle dir: {e}"));
+            return;
+        }
+        let sr = self.engine.as_ref().map(|e| e.sample_rate as u32).unwrap_or(48_000);
+        let bank_name = format!("{code}.wlabank");
+
+        // Encode each recorded section: a mixed clip + per-layer stems.
+        let mut clips: Vec<wlabank::BankClip> = Vec::new();
+        // (kind, pattern_id, len, in_regions, out_regions, layer_ids)
+        let mut specs_data: Vec<(SectionKind, String, u64, Vec<crate::navigator::model::Region>, Vec<crate::navigator::model::Region>, Vec<String>)> = Vec::new();
+
+        for kind in SectionKind::ORDER {
+            let Some(pcm) = self.section_pcm(kind) else { continue };
+            let Some(take) = self.section_takes.get(&kind) else { continue };
+            let pid = format!("{}1", kind.pattern_letter());
+            // Mixed clip = raw sum of the section's source stems.
+            let mix = sum_sources(&pcm);
+            match ogg::encode(&mix, 2, sr, 0.6) {
+                Ok(o) => clips.push(wlabank::BankClip {
+                    clip_name: format!("module_{bank_name}/{pid}"),
+                    channels: 2, sample_rate: sr,
+                    frame_count: pcm.len_frames as u64, ogg: o,
+                }),
+                Err(e) => { self.session_status = Some(format!("encode {pid}: {e}")); return; }
+            }
+            // Per-layer stems.
+            let mut layer_ids = Vec::new();
+            for (i, &src) in pcm.armed.iter().enumerate() {
+                let lid = format!("{pid}l{src}");
+                let Some(buf) = pcm.sources.get(i) else { continue };
+                match ogg::encode(buf, 2, sr, 0.6) {
+                    Ok(o) => clips.push(wlabank::BankClip {
+                        clip_name: format!("module_{bank_name}/{lid}"),
+                        channels: 2, sample_rate: sr,
+                        frame_count: pcm.len_frames as u64, ogg: o,
+                    }),
+                    Err(e) => { self.session_status = Some(format!("encode {lid}: {e}")); return; }
+                }
+                layer_ids.push(lid);
+            }
+            specs_data.push((kind, pid, pcm.len_frames as u64,
+                take.in_regions.clone(), take.out_regions.clone(), layer_ids));
+        }
+
+        if specs_data.is_empty() {
+            self.session_status = Some("record at least one section before exporting".into());
+            return;
+        }
+
+        let specs: Vec<wlamodel::SectionSpec<'_>> = specs_data.iter().map(|(kind, pid, len, inr, outr, lids)| {
+            wlamodel::SectionSpec {
+                kind: *kind, pattern_id: pid, len_frames: *len, bank_name: &bank_name,
+                in_regions: inr, out_regions: outr, layer_ids: lids.clone(),
+            }
+        }).collect();
+
+        let music_uuid = uuid::Uuid::new_v4().to_string();
+        let page_uuid = uuid::Uuid::new_v4().to_string();
+        let module_uuid = uuid::Uuid::new_v4().to_string();
+
+        let r = (|| -> Result<(), String> {
+            ttasset::write(&bundle_dir, &self.adaptive, &meta, &music_uuid, &page_uuid)?;
+            wlamodel::write(&bundle_dir, &code, &module_uuid, &page_uuid, &specs, sr)?;
+            wlabank::write(&clips, &bundle_dir.join(&bank_name))?;
+            Ok(())
+        })();
+        self.asset_meta = meta;
+        self.session_status = Some(match r {
+            Ok(()) => format!("exported asset \u{2192} {}", bundle_dir.display()),
+            Err(e) => format!("asset export error: {e}"),
+        });
+    }
+
+    /// Import a `<CODE>_TT/` bundle picked via a file dialog: parse the
+    /// three files, populate the mixer + asset meta + per-section takes
+    /// + regions, and decode the bank's per-layer stems to WAVs so the
+    /// existing playback/timeline paths work.
+    fn do_import_asset(&mut self) {
+        use crate::asset::{ogg, ttasset, wlabank, wlamodel};
+        let mut dlg = rfd::FileDialog::new()
+            .set_title("Import asset (.ttasset)")
+            .add_filter("Asset (.ttasset)", &["ttasset"]);
+        if let Some(dir) = crate::template::read_last_dir() {
+            dlg = dlg.set_directory(dir);
+        }
+        let Some(ttasset_path) = dlg.pick_file() else { return };
+        let dir = ttasset_path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        if let Some(p) = ttasset_path.parent() {
+            crate::template::write_last_dir(p);
+        }
+        // Derive the <CODE> from the .ttasset filename.
+        let code = ttasset_path.file_stem().and_then(|s| s.to_str()).unwrap_or("ANDD").to_string();
+
+        // Parse .ttasset → mixer + meta.
+        let mut meta = crate::navigator::model::AssetMeta::default();
+        if let Err(e) = ttasset::read(&ttasset_path, &mut self.adaptive, &mut meta) {
+            self.session_status = Some(format!("ttasset: {e}"));
+            return;
+        }
+        self.asset_meta = meta;
+
+        // Parse .wlamodel → sections.
+        let model_path = dir.join(format!("{code}.wlamodel"));
+        let sections = match wlamodel::read(&model_path) {
+            Ok((_, _, s)) => s,
+            Err(e) => { self.session_status = Some(format!("wlamodel: {e}")); return; }
+        };
+
+        // Decode .wlabank → per-layer WAVs into the session's recording dirs.
+        let bank_path = dir.join(format!("{code}.wlabank"));
+        let bank = match wlabank::read(&bank_path) {
+            Ok(b) => b,
+            Err(e) => { self.session_status = Some(format!("wlabank: {e}")); return; }
+        };
+        // Map clip name → decoded interleaved PCM.
+        let mut clip_pcm: HashMap<String, Vec<f32>> = HashMap::new();
+        for c in &bank {
+            if let Some(ogg_bytes) = &c.ogg {
+                if let Ok((pcm, _ch, _sr)) = ogg::decode(ogg_bytes) {
+                    // clip_name = "module_<bank>/<id>" → keep just <id>.
+                    let id = c.clip_name.rsplit('/').next().unwrap_or(&c.clip_name).to_string();
+                    clip_pcm.insert(id, pcm);
+                }
+            }
+        }
+
+        // Set up a session folder to hold the decoded WAVs.
+        if self.session_name.trim().is_empty() {
+            self.session_name = code.clone();
+        }
+        let Some(session_root) = crate::session::ensure_root(&self.session_name).ok() else {
+            self.session_status = Some("no session folder".into());
+            return;
+        };
+        if let Some(rec) = self.recorder.as_mut() {
+            rec.last_session = Some(session_root.clone());
+            rec.last_session_name = Some(self.session_name.clone());
+        }
+
+        self.section_cache.clear();
+        self.section_takes.clear();
+        self.playback.clear_adaptive_program();
+
+        for sec in &sections {
+            let rec_dir = crate::recording::recording_dir(&session_root, sec.kind.slug());
+            let _ = std::fs::create_dir_all(&rec_dir);
+            // Write each layer stem as source-NN.wav (NN from the layer id suffix).
+            let mut armed = Vec::new();
+            for lid in &sec.layer_ids {
+                // layer id = "<pid>l<src>" → parse trailing integer.
+                let src: usize = lid.rsplit('l').next().and_then(|n| n.parse().ok()).unwrap_or(0);
+                if let Some(pcm) = clip_pcm.get(lid) {
+                    let path = rec_dir.join(format!("source-{:02}.wav", src + 1));
+                    if let Err(e) = write_stereo_wav(&path, pcm, 48_000) {
+                        self.session_status = Some(format!("write {}: {e}", path.display()));
+                        return;
+                    }
+                    armed.push(src);
+                }
+            }
+            armed.sort_unstable();
+            self.section_takes.insert(sec.kind, SectionTake {
+                armed,
+                start_pulses: 0,
+                bpm: 0.0,
+                time_sig: self.time_sig_num,
+                user_offset_units: 0.0,
+                in_regions: sec.in_regions.clone(),
+                out_regions: sec.out_regions.clone(),
+            });
+        }
+
+        // Focus Main (or the first section) and load it.
+        let focus = SectionKind::ORDER.into_iter()
+            .find(|k| self.section_takes.contains_key(k))
+            .unwrap_or(SectionKind::Main);
+        self.current_section = focus;
+        self.load_section(focus);
+        self.session_status = Some(format!(
+            "imported {} section(s) from {}", self.section_takes.len(), dir.display()
+        ));
     }
 
     /// Resolve the session root from the recorder (last recording) or
@@ -1242,6 +1483,9 @@ impl State {
                 .width(Length::Fixed(70.0)),
             button(text("Export stems")).on_press(Message::ExportStems),
             button(text("Open folder")).on_press(Message::OpenSessionFolder),
+            Space::with_width(Length::Fixed(8.0)),
+            button(text("Save Asset")).on_press(Message::SaveAsset),
+            button(text("Import Asset")).on_press(Message::ImportAsset),
         ]
         .spacing(6)
         .align_y(Alignment::Center);
@@ -2189,6 +2433,37 @@ impl canvas::Program<Message> for Lane {
 
         vec![frame.into_geometry()]
     }
+}
+
+/// Sum a take's per-source interleaved-stereo buffers into one stereo mix.
+fn sum_sources(data: &crate::playback::PlaybackData) -> Vec<f32> {
+    let n = data.len_frames * 2;
+    let mut mix = vec![0.0f32; n];
+    for src in &data.sources {
+        for (i, &s) in src.iter().enumerate() {
+            if i < n {
+                mix[i] += s;
+            }
+        }
+    }
+    mix
+}
+
+/// Write interleaved-stereo f32 PCM to a 32-bit-float stereo WAV.
+fn write_stereo_wav(path: &std::path::Path, interleaved: &[f32], sample_rate: u32) -> Result<(), String> {
+    let spec = hound::WavSpec {
+        channels: 2,
+        sample_rate,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+    let mut w = hound::WavWriter::create(path, spec)
+        .map_err(|e| format!("create wav: {e}"))?;
+    for &s in interleaved {
+        w.write_sample(s).map_err(|e| format!("write sample: {e}"))?;
+    }
+    w.finalize().map_err(|e| format!("finalize wav: {e}"))?;
+    Ok(())
 }
 
 fn lane_view(

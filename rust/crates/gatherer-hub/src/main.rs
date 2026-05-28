@@ -12,6 +12,7 @@ mod app;
 mod audio;
 mod export;
 mod measurement;
+mod asset;
 mod midi;
 mod navigator;
 mod params;
