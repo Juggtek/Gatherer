@@ -17,6 +17,7 @@ mod navigator;
 mod params;
 mod playback;
 mod recording;
+mod sequencer;
 mod session;
 mod template;
 
