@@ -240,8 +240,10 @@ impl Sequencer {
         let new_head = advance_head(head, n, section.loop_range);
 
         if let Some(pe) = pending {
-            // B must start `in_len` frames before A reaches the sync.
-            let in_len = region_len(&pe.to_in);
+            // B must start `in_len` frames before A reaches the sync, so
+            // B's local head reaches `in.end` (its sync) at the same wall
+            // frame A's head reaches `out.begin` (its sync).
+            let in_len = pe.to_in.end_frames.saturating_sub(pe.to_in.begin_frames);
             let b_start_head = pe.out.begin_frames.saturating_sub(in_len);
             if new_head >= b_start_head {
                 // Enter the cross. B starts at its in-region begin; if we
@@ -368,58 +370,9 @@ fn advance_head(head: u64, n: u64, loop_range: Option<(u64, u64)>) -> u64 {
     next
 }
 
-fn region_len(r: &Region) -> u64 {
-    r.end_frames.saturating_sub(r.begin_frames)
-}
-
-/// Gain of an in-region (fade-in) at local frame `local`. Sync at
-/// `sync_frames`; the fade occupies the last `len*fade_pct` frames
-/// ending at sync. `fade_pct == 0` ⇒ full gain throughout (pre-faded).
-fn in_gain(r: &Region, local: u64) -> f32 {
-    if r.fade_pct <= 0.0 {
-        return 1.0;
-    }
-    let len = region_len(r) as f32;
-    let fade_len = (len * r.fade_pct).max(1.0);
-    let fade_start = r.sync_frames.saturating_sub(fade_len as u64);
-    if local <= fade_start {
-        0.0
-    } else if local >= r.sync_frames {
-        1.0
-    } else {
-        let x = (local - fade_start) as f32 / fade_len;
-        shape(x, r.fade_shape)
-    }
-}
-
-/// Gain of an out-region (fade-out) at local frame `local`. Sync at
-/// `sync_frames`; the fade occupies the first `len*fade_pct` frames
-/// starting at sync. `fade_pct == 0` ⇒ full gain until the region end.
-fn out_gain(r: &Region, local: u64) -> f32 {
-    if r.fade_pct <= 0.0 {
-        return 1.0;
-    }
-    let len = region_len(r) as f32;
-    let fade_len = (len * r.fade_pct).max(1.0);
-    let fade_end = r.sync_frames + fade_len as u64;
-    if local <= r.sync_frames {
-        1.0
-    } else if local >= fade_end {
-        0.0
-    } else {
-        let x = (local - r.sync_frames) as f32 / fade_len;
-        1.0 - shape(x, r.fade_shape)
-    }
-}
-
-/// Map a normalised 0..1 fade position through the shape parameter.
-/// `0.5` ≈ linear; higher pushes toward an equal-power-ish curve. Kept
-/// simple for v1 (linear); `fade_shape` reserved for a real curve.
-fn shape(x: f32, _fade_shape: f32) -> f32 {
-    x.clamp(0.0, 1.0)
-}
-
-/// Build the two-voice mix during a cross.
+/// Build the two-voice mix during a cross. Fade gains come from the
+/// canonical [`Region::gain_as_out`] / [`Region::gain_as_in`] geometry
+/// (sync at out.begin / in.end; fade length scales with `fade_pct`).
 fn cross_mix(
     from: usize,
     from_head: u64,
@@ -428,8 +381,8 @@ fn cross_mix(
     to_head: u64,
     to_in: &Region,
 ) -> Mix {
-    let a_gain = out_gain(from_out, from_head);
-    let b_gain = in_gain(to_in, to_head);
+    let a_gain = from_out.gain_as_out(from_head);
+    let b_gain = to_in.gain_as_in(to_head);
     let a = (a_gain > 0.0 || from_head <= from_out.sync_frames).then_some(Voice {
         section: from,
         frame: from_head,
@@ -559,24 +512,47 @@ mod tests {
 
     #[test]
     fn fade_pct_zero_skips_envelope() {
-        // An out-region with fade_pct=0 stays at full gain across its
-        // whole span (no engine ramp); an in-region with fade_pct=0 is
-        // full from the start.
+        // fade_pct=0 ⇒ full gain throughout (pre-faded audio).
         let out0 = Region::new_out(1000, 1100, 0.0, 0.5);
-        assert_eq!(out_gain(&out0, 1000), 1.0);
-        assert_eq!(out_gain(&out0, 1050), 1.0, "no ramp mid-region");
-        assert_eq!(out_gain(&out0, 1099), 1.0);
+        assert_eq!(out0.gain_as_out(1000), 1.0);
+        assert_eq!(out0.gain_as_out(1050), 1.0, "no ramp mid-region");
+        assert_eq!(out0.gain_as_out(1099), 1.0);
 
         let in0 = Region::new_in(0, 100, 0.0, 0.5);
-        assert_eq!(in_gain(&in0, 0), 1.0, "full from the start");
-        assert_eq!(in_gain(&in0, 50), 1.0);
-        assert_eq!(in_gain(&in0, 100), 1.0);
+        assert_eq!(in0.gain_as_in(0), 1.0, "full from the start");
+        assert_eq!(in0.gain_as_in(50), 1.0);
+        assert_eq!(in0.gain_as_in(100), 1.0);
+    }
 
-        // Contrast: fade_pct=1 ramps.
+    #[test]
+    fn fade_geometry_matches_spec() {
+        // In-region fade_pct=1: linear ramp begin→end (sync), 0→1.
         let in1 = Region::new_in(0, 100, 1.0, 0.5);
-        assert!(in_gain(&in1, 0) < 0.1, "ramps from ~0");
-        assert!((in_gain(&in1, 100) - 1.0).abs() < 1e-3, "reaches 1 at sync");
-        assert!((in_gain(&in1, 50) - 0.5).abs() < 0.05, "linear midpoint");
+        assert!(in1.gain_as_in(0) < 1e-3, "starts at 0");
+        assert!((in1.gain_as_in(50) - 0.5).abs() < 0.02, "linear midpoint");
+        assert!((in1.gain_as_in(100) - 1.0).abs() < 1e-3, "full at sync (end)");
+
+        // fade_pct=0.5: reaches full at the region midpoint, then holds.
+        let in_half = Region::new_in(0, 100, 0.5, 0.5);
+        assert!((in_half.gain_as_in(50) - 1.0).abs() < 1e-3, "full by midpoint");
+        assert!((in_half.gain_as_in(100) - 1.0).abs() < 1e-3, "still full at end");
+
+        // fade_pct=2: ramp extends past the sync; at sync it's mid-fade.
+        let in_two = Region::new_in(0, 100, 2.0, 0.5);
+        assert!((in_two.gain_as_in(100) - 0.5).abs() < 0.05, "~0.5 at sync (end)");
+        assert!((in_two.gain_as_in(200) - 1.0).abs() < 1e-3, "full at begin+2·span");
+
+        // Out-region fade_pct=1: 1→0 from begin (sync) to end.
+        let out1 = Region::new_out(0, 100, 1.0, 0.5);
+        assert!((out1.gain_as_out(0) - 1.0).abs() < 1e-3, "full at sync (begin)");
+        assert!((out1.gain_as_out(50) - 0.5).abs() < 0.02, "linear midpoint");
+        assert!(out1.gain_as_out(100) < 1e-3, "0 at end");
+
+        // Shape: exponential (<0.5) is convex (below linear at midpoint).
+        let expo = Region::new_in(0, 100, 1.0, 0.1);
+        assert!(expo.gain_as_in(50) < 0.5, "exponential is below linear");
+        let logo = Region::new_in(0, 100, 1.0, 0.9);
+        assert!(logo.gain_as_in(50) > 0.5, "logarithmic is above linear");
     }
 
     #[test]

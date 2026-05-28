@@ -101,12 +101,25 @@ pub enum Message {
     ToggleSequencePlayback,
     TriggerSequenceExit,
     // ── Phase C: region authoring ──────────────────────────────────
-    /// Drop an out-region at the current playhead on the active section.
+    /// Drop an in-region / out-region at the current playhead.
+    AddInRegionAtPlayhead,
     AddOutRegionAtPlayhead,
-    /// Generate evenly-spaced out-regions every `bars` bars across the
-    /// active section's full length.
+    /// Generate beat-aligned out-regions every `exit_bars` bars across
+    /// the whole section, or within the drag-selected range.
     GenerateExitRegions,
+    GenerateExitRegionsInRange,
     SetExitBars(u32),
+    /// Region metadata applied to new/generated regions.
+    SetRegionFadeShape(f32),
+    SetRegionFadePct(f32),
+    SetRegionGroup(i32),
+    /// Loop window (Main): set begin/end at playhead, or clear.
+    SetLoopBeginAtPlayhead,
+    SetLoopEndAtPlayhead,
+    ClearLoop,
+    /// Timeline range selection (units), set by dragging the ruler.
+    SetSelectionRangeUnits(f32, f32),
+    ClearSelection,
     /// Remove all in/out regions from the active section.
     ClearRegions,
     // ── Phase F: asset bundle I/O ──────────────────────────────────
@@ -184,6 +197,12 @@ pub struct State {
 
     /// "Generate exits every N bars" parameter (Phase C). Default 2 bars.
     exit_bars: u32,
+    /// Region metadata applied to newly added / generated regions.
+    region_fade_shape: f32, // 0..1 (0 expo, 0.5 linear, 1 log)
+    region_fade_pct: f32,   // fade length scale; 1.0 = begin↔sync
+    region_group: u32,
+    /// Drag-selected frame range on the timeline (for "generate in range").
+    selection_range: Option<(u64, u64)>,
     /// Asset bundle metadata (production code / variant / asset name) for
     /// Save-as-Asset. Authored properly in B1; for now defaults + derived
     /// from the session name on export.
@@ -223,6 +242,9 @@ struct SectionTake {
     /// each session load until Phase B1 wires them through the project tree.
     in_regions: Vec<crate::navigator::model::Region>,
     out_regions: Vec<crate::navigator::model::Region>,
+    /// Loop window `(begin, end)` in frames (Main section). `None` ⇒ the
+    /// whole take loops.
+    loop_range: Option<(u64, u64)>,
 }
 
 impl State {
@@ -269,6 +291,10 @@ impl State {
             adaptive: AdaptiveMixer::new(),
             target_curve_popover_open: false,
             exit_bars: 2,
+            region_fade_shape: 0.5,
+            region_fade_pct: 1.0,
+            region_group: 0,
+            selection_range: None,
             asset_meta: crate::navigator::model::AssetMeta::default(),
             current_section: SectionKind::Main,
             section_takes: HashMap::new(),
@@ -642,59 +668,64 @@ impl State {
                     self.playback.seq_request_exit();
                 }
             }
-            Message::SetExitBars(n) => {
-                self.exit_bars = n.max(1);
+            Message::SetExitBars(n) => self.exit_bars = n.max(1),
+            Message::SetRegionFadeShape(v) => self.region_fade_shape = v.clamp(0.0, 1.0),
+            Message::SetRegionFadePct(v) => self.region_fade_pct = v.clamp(0.0, 2.0),
+            Message::SetRegionGroup(d) => {
+                self.region_group = (self.region_group as i32 + d).clamp(0, 15) as u32;
             }
-            Message::AddOutRegionAtPlayhead => {
-                let sr = self.engine.as_ref().map(|e| e.sample_rate).unwrap_or(48_000.0);
-                let pos_frames = (self.playback.position() as f32) as u64;
-                // 2-beat fade window centred on the playhead (arbitrary sane default).
-                let beat_frames = if self.take_start_bpm > 0.0 {
-                    (sr * 60.0 / self.take_start_bpm) as u64
-                } else {
-                    (sr * 0.5) as u64 // 500 ms fallback
-                };
-                let fade_len = beat_frames;
-                let region = crate::navigator::model::Region::new_out(
-                    pos_frames,
-                    pos_frames + fade_len,
-                    1.0,
-                    0.756,
-                );
-                if let Some(t) = self.section_takes.get_mut(&self.current_section) {
-                    t.out_regions.push(region);
-                    t.out_regions.sort_by_key(|r| r.begin_frames);
-                }
-            }
+            Message::AddInRegionAtPlayhead => self.add_region_at_playhead(true),
+            Message::AddOutRegionAtPlayhead => self.add_region_at_playhead(false),
             Message::GenerateExitRegions => {
-                let sr = self.engine.as_ref().map(|e| e.sample_rate).unwrap_or(48_000.0);
-                let bpm = self.take_start_bpm;
-                let beats_per_bar = self.take_start_time_sig as f32;
-                let cached_len = self.section_cache.get(&self.current_section)
-                    .map(|c| c.data.len_frames as u64)
-                    .unwrap_or(0);
-                if cached_len == 0 || bpm <= 0.0 {
-                    return Task::none();
-                }
-                let bar_frames = (sr * 60.0 / bpm * beats_per_bar) as u64;
-                let exit_bars = self.exit_bars as u64;
-                let interval = bar_frames * exit_bars;
-                let fade_frames = bar_frames / 2; // half-bar fade
-                let mut regions = Vec::new();
-                let mut pos = interval;
-                while pos + fade_frames < cached_len {
-                    regions.push(crate::navigator::model::Region::new_out(
-                        pos,
-                        pos + fade_frames,
-                        1.0,
-                        0.756,
-                    ));
-                    pos += interval;
-                }
-                if let Some(t) = self.section_takes.get_mut(&self.current_section) {
-                    t.out_regions = regions;
+                let len = self.current_section_len();
+                if len > 0 {
+                    let regions = self.generate_out_regions(0, len);
+                    if let Some(t) = self.section_takes.get_mut(&self.current_section) {
+                        t.out_regions = regions;
+                    }
                 }
             }
+            Message::GenerateExitRegionsInRange => {
+                if let Some((a, b)) = self.selection_range {
+                    let regions = self.generate_out_regions(a, b);
+                    if let Some(t) = self.section_takes.get_mut(&self.current_section) {
+                        // Replace only regions inside the range; keep others.
+                        t.out_regions.retain(|r| r.begin_frames < a || r.begin_frames > b);
+                        t.out_regions.extend(regions);
+                        t.out_regions.sort_by_key(|r| r.begin_frames);
+                    }
+                } else {
+                    self.session_status = Some("drag a range on the ruler first".into());
+                }
+            }
+            Message::SetLoopBeginAtPlayhead => {
+                let pos = self.playback.position();
+                if let Some(t) = self.section_takes.get_mut(&self.current_section) {
+                    let end = t.loop_range.map(|(_, e)| e).unwrap_or(u64::MAX);
+                    let end = if end <= pos { pos + 1 } else { end };
+                    t.loop_range = Some((pos, end));
+                }
+            }
+            Message::SetLoopEndAtPlayhead => {
+                let pos = self.playback.position();
+                if let Some(t) = self.section_takes.get_mut(&self.current_section) {
+                    let begin = t.loop_range.map(|(b, _)| b).unwrap_or(0);
+                    let begin = if begin >= pos { pos.saturating_sub(1) } else { begin };
+                    t.loop_range = Some((begin, pos));
+                }
+            }
+            Message::ClearLoop => {
+                if let Some(t) = self.section_takes.get_mut(&self.current_section) {
+                    t.loop_range = None;
+                }
+            }
+            Message::SetSelectionRangeUnits(a, b) => {
+                let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                let fa = self.units_to_section_frames(lo);
+                let fb = self.units_to_section_frames(hi);
+                self.selection_range = Some((fa, fb));
+            }
+            Message::ClearSelection => self.selection_range = None,
             Message::ClearRegions => {
                 if let Some(t) = self.section_takes.get_mut(&self.current_section) {
                     t.in_regions.clear();
@@ -744,11 +775,11 @@ impl State {
         if armed.is_empty() {
             return;
         }
-        // Preserve any regions the user authored before re-recording.
-        let prev_in = self.section_takes.get(&self.current_section)
-            .map(|t| t.in_regions.clone()).unwrap_or_default();
-        let prev_out = self.section_takes.get(&self.current_section)
-            .map(|t| t.out_regions.clone()).unwrap_or_default();
+        // Preserve any regions + loop the user authored before re-recording.
+        let prev = self.section_takes.get(&self.current_section);
+        let prev_in = prev.map(|t| t.in_regions.clone()).unwrap_or_default();
+        let prev_out = prev.map(|t| t.out_regions.clone()).unwrap_or_default();
+        let prev_loop = prev.and_then(|t| t.loop_range);
         self.section_takes.insert(
             self.current_section,
             SectionTake {
@@ -759,6 +790,7 @@ impl State {
                 user_offset_units: 0.0,
                 in_regions: prev_in,
                 out_regions: prev_out,
+                loop_range: prev_loop,
             },
         );
         self.load_section(self.current_section);
@@ -793,14 +825,16 @@ impl State {
             let len = data.len_frames as u64;
             let authored_in = take.in_regions.clone();
             let authored_out = take.out_regions.clone();
+            // Main loops its authored loop window (fallback: whole take).
+            let loop_range = if kind == SectionKind::Main {
+                Some(take.loop_range.unwrap_or((0, len)))
+            } else {
+                None
+            };
             geometry.push(AdaptiveSection {
                 kind,
                 length: len,
-                loop_range: if kind == SectionKind::Main {
-                    Some((0, len))
-                } else {
-                    None
-                },
+                loop_range,
                 in_regions: authored_in,
                 out_regions: authored_out,
             });
@@ -813,6 +847,123 @@ impl State {
             return None;
         }
         Some(crate::playback::AdaptiveProgram { geometry, audio })
+    }
+
+    // ── Phase C region authoring helpers ────────────────────────────
+
+    fn current_section_len(&self) -> u64 {
+        self.section_cache
+            .get(&self.current_section)
+            .map(|c| c.data.len_frames as u64)
+            .unwrap_or(0)
+    }
+
+    /// Frames per bar for the active take (0 if no BPM / not playing).
+    fn bar_frames(&self) -> f32 {
+        let sr = self.engine.as_ref().map(|e| e.sample_rate).unwrap_or(48_000.0);
+        let bpb = self.take_start_time_sig.max(1) as f32;
+        if self.take_start_bpm > 0.0 {
+            sr * 60.0 / self.take_start_bpm * bpb
+        } else {
+            0.0
+        }
+    }
+
+    /// Frame of the first bar downbeat at/after the take's frame 0,
+    /// accounting for the take starting mid-bar (`start_pulses`).
+    fn first_downbeat_frames(&self) -> u64 {
+        let bf = self.bar_frames();
+        if bf <= 0.0 {
+            return 0;
+        }
+        let bpb = self.take_start_time_sig.max(1);
+        let take_start_units = self.take_start_pulses as f32 / (PPQN * bpb) as f32;
+        let frac = take_start_units.fract();
+        if frac < 1e-4 {
+            0
+        } else {
+            ((1.0 - frac) * bf) as u64
+        }
+    }
+
+    /// Convert a timeline position in *units* (bars) to a frame offset
+    /// within the active take, accounting for the take's visual start +
+    /// drag offset (mirrors `set_playhead_units`).
+    fn units_to_section_frames(&self, units: f32) -> u64 {
+        let sr = self.engine.as_ref().map(|e| e.sample_rate).unwrap_or(48_000.0);
+        let bpm = self.take_start_bpm;
+        let bpb = self.take_start_time_sig.max(1);
+        let take_start_units = if bpm > 0.0 {
+            self.take_start_pulses as f32 / (PPQN * bpb) as f32
+        } else {
+            0.0
+        };
+        let unit_seconds = if bpm > 0.0 { 60.0 / bpm * bpb as f32 } else { 1.0 };
+        let visual_start = take_start_units + self.take_user_offset_units;
+        let offset_units = (units - visual_start).max(0.0);
+        (offset_units * unit_seconds * sr) as u64
+    }
+
+    /// Add an in/out region at the playhead using the current metadata
+    /// (fade shape / pct / group). Fade length = one bar (or 0.5 s).
+    fn add_region_at_playhead(&mut self, is_in: bool) {
+        let pos = self.playback.position();
+        let bf = self.bar_frames();
+        let span = if bf > 0.0 { bf as u64 } else { (24_000.0_f32) as u64 };
+        let (shape, pct, grp) = (self.region_fade_shape, self.region_fade_pct, self.region_group);
+        if let Some(t) = self.section_takes.get_mut(&self.current_section) {
+            if is_in {
+                // in-region sync = end → place `end` at the playhead so the
+                // entry aligns there: region [pos−span, pos].
+                let begin = pos.saturating_sub(span);
+                let mut r = crate::navigator::model::Region::new_in(begin, pos, pct, shape);
+                r.group = grp;
+                t.in_regions.push(r);
+                t.in_regions.sort_by_key(|r| r.begin_frames);
+            } else {
+                // out-region sync = begin → place `begin` at the playhead:
+                // region [pos, pos+span].
+                let mut r = crate::navigator::model::Region::new_out(pos, pos + span, pct, shape);
+                r.group = grp;
+                t.out_regions.push(r);
+                t.out_regions.sort_by_key(|r| r.begin_frames);
+            }
+        }
+    }
+
+    /// Beat-aligned out-regions every `exit_bars` bars within `[from,to]`
+    /// frames. Region begins land on bar downbeats (accounting for the
+    /// take's mid-bar start); fade window = one bar, with the current
+    /// metadata.
+    fn generate_out_regions(&self, from: u64, to: u64) -> Vec<crate::navigator::model::Region> {
+        let bf = self.bar_frames();
+        if bf <= 0.0 {
+            return Vec::new();
+        }
+        let first = self.first_downbeat_frames();
+        let interval = (bf * self.exit_bars as f32) as u64;
+        if interval == 0 {
+            return Vec::new();
+        }
+        let fade = bf as u64; // one-bar fade window
+        // Find the first downbeat >= from.
+        let mut pos = first;
+        while pos < from {
+            pos += interval;
+        }
+        let mut out = Vec::new();
+        while pos < to && pos + 1 < self.current_section_len().max(to) {
+            let mut r = crate::navigator::model::Region::new_out(
+                pos,
+                pos + fade,
+                self.region_fade_pct,
+                self.region_fade_shape,
+            );
+            r.group = self.region_group;
+            out.push(r);
+            pos += interval;
+        }
+        out
     }
 
     /// Decoded per-source audio for a section (cache hit, else disk).
@@ -888,10 +1039,11 @@ impl State {
                 }),
                 Err(e) => { self.session_status = Some(format!("encode {pid}: {e}")); return; }
             }
-            // Per-layer stems.
+            // Per-layer stems. Layer ids are 1-based to match the engine
+            // (Atlas: m1l1..m1l7), so source index `src` → `l{src+1}`.
             let mut layer_ids = Vec::new();
             for (i, &src) in pcm.armed.iter().enumerate() {
-                let lid = format!("{pid}l{src}");
+                let lid = format!("{pid}l{}", src + 1);
                 let Some(buf) = pcm.sources.get(i) else { continue };
                 match ogg::encode(buf, 2, sr, 0.6) {
                     Ok(o) => clips.push(wlabank::BankClip {
@@ -1012,8 +1164,10 @@ impl State {
             // Write each layer stem as source-NN.wav (NN from the layer id suffix).
             let mut armed = Vec::new();
             for lid in &sec.layer_ids {
-                // layer id = "<pid>l<src>" → parse trailing integer.
-                let src: usize = lid.rsplit('l').next().and_then(|n| n.parse().ok()).unwrap_or(0);
+                // layer id = "<pid>l<N>" with N 1-based (Atlas convention)
+                // → source index = N − 1.
+                let n: usize = lid.rsplit('l').next().and_then(|n| n.parse().ok()).unwrap_or(1);
+                let src = n.saturating_sub(1);
                 if let Some(pcm) = clip_pcm.get(lid) {
                     let path = rec_dir.join(format!("source-{:02}.wav", src + 1));
                     if let Err(e) = write_stereo_wav(&path, pcm, 48_000) {
@@ -1024,6 +1178,12 @@ impl State {
                 }
             }
             armed.sort_unstable();
+            // Main's loop window comes from the wlamodel pattern loop.
+            let loop_range = if sec.kind == SectionKind::Main && sec.len_frames > 0 {
+                Some((0, sec.len_frames))
+            } else {
+                None
+            };
             self.section_takes.insert(sec.kind, SectionTake {
                 armed,
                 start_pulses: 0,
@@ -1032,6 +1192,7 @@ impl State {
                 user_offset_units: 0.0,
                 in_regions: sec.in_regions.clone(),
                 out_regions: sec.out_regions.clone(),
+                loop_range,
             });
         }
 
@@ -1251,6 +1412,7 @@ impl State {
                     user_offset_units: take.take_user_offset_units,
                     in_regions: Vec::new(),
                     out_regions: Vec::new(),
+                    loop_range: None,
                 },
             );
         }
@@ -1456,16 +1618,6 @@ impl State {
             button(text("100%")).on_press(Message::ZoomReset),
             Space::with_width(Length::Fixed(8.0)),
             checkbox("Snap", self.snap_to_grid).on_toggle(Message::ToggleSnap),
-            Space::with_width(Length::Fixed(12.0)),
-            text("Regions").size(11),
-            button(text("+Exit").size(11)).on_press(Message::AddOutRegionAtPlayhead),
-            text("every").size(11),
-            slider(1u32..=32, self.exit_bars, Message::SetExitBars)
-                .step(1u32)
-                .width(Length::Fixed(80.0)),
-            text(format!("{}bar", self.exit_bars)).size(11).width(Length::Fixed(36.0)),
-            button(text("Generate").size(11)).on_press(Message::GenerateExitRegions),
-            button(text("Clear").size(11)).on_press(Message::ClearRegions),
             Space::with_width(Length::Fill),
             // Template I/O — Max-patch 97-float .txt format. Import opens
             // a native file dialog (last dir remembered between launches
@@ -1560,6 +1712,7 @@ impl State {
         // Section tabs (Intro / Main / Outro) sit just above the
         // timeline — switching swaps the recording target + playback.
         let section_tabs = self.section_tabs();
+        let region_strip = self.region_strip();
 
         // Body is the full layout — main_body has Length::Fill so the
         // control strip pins to the bottom of the window.
@@ -1570,6 +1723,7 @@ impl State {
             action_strip,
             action_status,
             section_tabs,
+            region_strip,
             main_body,
             masks_strip,
             control_strip,
@@ -1828,6 +1982,77 @@ impl State {
         row_el.into()
     }
 
+    /// Region-authoring strip (Phase C), below the section tabs. Add
+    /// in/out regions at the playhead, set fade metadata, generate
+    /// beat-aligned exits across the section or a selected range, and
+    /// define the Main loop window.
+    fn region_strip(&self) -> Element<'_, Message> {
+        let has_range = self.selection_range.is_some();
+        let is_main = self.current_section == SectionKind::Main;
+        let loop_txt = self
+            .section_takes
+            .get(&self.current_section)
+            .and_then(|t| t.loop_range)
+            .map(|(b, e)| format!("loop {}\u{2013}{}", b, e))
+            .unwrap_or_else(|| "loop —".into());
+
+        let mut r = row![text("Regions").size(11)]
+            .spacing(6)
+            .align_y(Alignment::Center);
+        r = r
+            .push(button(text("+In").size(11)).on_press(Message::AddInRegionAtPlayhead))
+            .push(button(text("+Exit").size(11)).on_press(Message::AddOutRegionAtPlayhead))
+            // fade metadata applied to new/generated regions
+            .push(text("Shape").size(11))
+            .push(
+                slider(0.0..=1.0, self.region_fade_shape, Message::SetRegionFadeShape)
+                    .step(0.01)
+                    .width(Length::Fixed(70.0)),
+            )
+            .push(text(format!("{:.2}", self.region_fade_shape)).size(10).width(Length::Fixed(28.0)))
+            .push(text("Pct").size(11))
+            .push(
+                slider(0.0..=2.0, self.region_fade_pct, Message::SetRegionFadePct)
+                    .step(0.05)
+                    .width(Length::Fixed(70.0)),
+            )
+            .push(text(format!("{:.2}", self.region_fade_pct)).size(10).width(Length::Fixed(28.0)))
+            .push(text("Grp").size(11))
+            .push(button(text("\u{2212}").size(10)).on_press(Message::SetRegionGroup(-1)))
+            .push(text(format!("{}", self.region_group)).size(11).width(Length::Fixed(16.0)))
+            .push(button(text("+").size(10)).on_press(Message::SetRegionGroup(1)))
+            // generate
+            .push(Space::with_width(Length::Fixed(8.0)))
+            .push(text("every").size(11))
+            .push(button(text("\u{2212}").size(10)).on_press(Message::SetExitBars(self.exit_bars.saturating_sub(1))))
+            .push(text(format!("{}bar", self.exit_bars)).size(11).width(Length::Fixed(38.0)))
+            .push(button(text("+").size(10)).on_press(Message::SetExitBars(self.exit_bars + 1)))
+            .push(button(text("Generate").size(11)).on_press(Message::GenerateExitRegions));
+        // Gen-in-range only when a selection exists.
+        let mut gen_range = button(text("Gen range").size(11));
+        if has_range {
+            gen_range = gen_range.on_press(Message::GenerateExitRegionsInRange);
+        }
+        r = r
+            .push(gen_range)
+            .push(button(text("Clear regions").size(11)).on_press(Message::ClearRegions));
+        // Loop controls (Main only).
+        if is_main {
+            r = r
+                .push(Space::with_width(Length::Fixed(10.0)))
+                .push(text(loop_txt).size(10).width(Length::Fixed(110.0)))
+                .push(button(text("Loop\u{2190}").size(11)).on_press(Message::SetLoopBeginAtPlayhead))
+                .push(button(text("Loop\u{2192}").size(11)).on_press(Message::SetLoopEndAtPlayhead))
+                .push(button(text("\u{2715}").size(11)).on_press(Message::ClearLoop));
+        }
+        if has_range {
+            r = r
+                .push(Space::with_width(Length::Fixed(8.0)))
+                .push(button(text("Clear sel").size(11)).on_press(Message::ClearSelection));
+        }
+        r.into()
+    }
+
     fn masks_strip(&self) -> Element<'_, Message> {
         const SLIDER_H: f32 = 48.0;
         const SLIDER_W: f32 = 14.0;
@@ -2051,18 +2276,24 @@ impl State {
             } else {
                 (take_start_x, take_end_x)
             };
-            // Regions from the active section (only the first source row
-            // shows the overlay visually; same data for all lanes).
-            let (total_frames, in_r, out_r) = if !recording && i == 0 {
+            // Region/loop/selection overlay — only on the first source
+            // row (same regions apply to the whole section).
+            let overlay = if !recording && i == 0 {
                 if let Some(t) = self.section_takes.get(&self.current_section) {
                     let len = self.section_cache.get(&self.current_section)
                         .map(|c| c.data.len_frames as u64).unwrap_or(0);
-                    (len, t.in_regions.clone(), t.out_regions.clone())
+                    RegionOverlay {
+                        total_frames: len,
+                        in_regions: t.in_regions.clone(),
+                        out_regions: t.out_regions.clone(),
+                        loop_range: t.loop_range,
+                        selection: self.selection_range,
+                    }
                 } else {
-                    (0, Vec::new(), Vec::new())
+                    RegionOverlay::default()
                 }
             } else {
-                (0, Vec::new(), Vec::new())
+                RegionOverlay::default()
             };
             timeline_col = timeline_col.push(lane_view(
                 total_pixels,
@@ -2073,9 +2304,7 @@ impl State {
                 pixels_per_unit,
                 offset_units,
                 draggable,
-                total_frames,
-                in_r,
-                out_r,
+                overlay,
             ));
         }
 
@@ -2238,10 +2467,20 @@ struct Lane {
     /// Only loaded takes can be dragged; live previews and empty lanes are
     /// click-to-seek only.
     draggable: bool,
-    /// Total length of the take in sample frames (for region → pixel mapping).
+    /// Region/loop/selection overlay data (only populated on the lane
+    /// that shows the overlay; empty elsewhere).
+    overlay: RegionOverlay,
+}
+
+/// Region + loop + selection overlay data for a lane. Frame-based;
+/// mapped to pixels against `[take_start_x, take_end_x]`.
+#[derive(Default, Clone)]
+struct RegionOverlay {
     total_frames: u64,
     in_regions: Vec<crate::navigator::model::Region>,
     out_regions: Vec<crate::navigator::model::Region>,
+    loop_range: Option<(u64, u64)>,
+    selection: Option<(u64, u64)>,
 }
 
 /// Per-Lane drag state, persisted by iced between renders of the same
@@ -2381,41 +2620,92 @@ impl canvas::Program<Message> for Lane {
             }
         }
 
-        // Region overlays: in-regions (blue-green) and out-regions (amber).
-        // Drawn as semi-transparent bands over the waveform.
-        if self.total_frames > 0 && self.take_end_x > self.take_start_x {
+        // Region / loop / selection overlays. Fades are drawn as the
+        // actual gain curve (filled under the ramp) per the canonical
+        // Region geometry; the sync point gets a bright vertical line.
+        let ov = &self.overlay;
+        if ov.total_frames > 0 && self.take_end_x > self.take_start_x {
             let take_w = self.take_end_x - self.take_start_x;
-            let frames = self.total_frames as f32;
+            let frames = ov.total_frames as f32;
             let region_x = |f: u64| self.take_start_x + (f as f32 / frames) * take_w;
-            for r in &self.in_regions {
-                let x0 = region_x(r.begin_frames).max(0.0);
-                let x1 = region_x(r.end_frames).min(w);
+
+            // Selection band (under everything else).
+            if let Some((a, b)) = ov.selection {
+                let x0 = region_x(a).clamp(0.0, w);
+                let x1 = region_x(b).clamp(0.0, w);
                 if x1 > x0 {
                     frame.fill_rectangle(
                         Point::new(x0, 0.0),
                         Size::new(x1 - x0, h),
-                        Color { r: 0.20, g: 0.75, b: 0.55, a: 0.28 },
+                        Color { r: 0.5, g: 0.5, b: 0.9, a: 0.18 },
                     );
-                    // sync line
-                    let sx = region_x(r.sync_frames).clamp(0.0, w);
-                    frame.fill_rectangle(Point::new(sx, 0.0), Size::new(1.0, h),
-                        Color { r: 0.25, g: 0.90, b: 0.65, a: 0.80 });
                 }
             }
-            for r in &self.out_regions {
-                let x0 = region_x(r.begin_frames).max(0.0);
-                let x1 = region_x(r.end_frames).min(w);
-                if x1 > x0 {
-                    frame.fill_rectangle(
-                        Point::new(x0, 0.0),
-                        Size::new(x1 - x0, h),
-                        Color { r: 0.95, g: 0.65, b: 0.10, a: 0.25 },
-                    );
-                    // sync line
-                    let sx = region_x(r.sync_frames).clamp(0.0, w);
-                    frame.fill_rectangle(Point::new(sx, 0.0), Size::new(1.0, h),
-                        Color { r: 1.0, g: 0.80, b: 0.20, a: 0.85 });
+
+            // Loop window (Main): bracket lines at begin/end.
+            if let Some((b, e)) = ov.loop_range {
+                let xb = region_x(b).clamp(0.0, w);
+                let xe = region_x(e).clamp(0.0, w);
+                let loop_col = Color { r: 0.55, g: 0.85, b: 1.0, a: 0.9 };
+                frame.fill_rectangle(Point::new(xb, 0.0), Size::new(2.0, h), loop_col);
+                frame.fill_rectangle(Point::new(xe - 2.0, 0.0), Size::new(2.0, h), loop_col);
+                frame.fill_rectangle(
+                    Point::new(xb, 0.0),
+                    Size::new((xe - xb).max(0.0), h),
+                    Color { r: 0.40, g: 0.70, b: 1.0, a: 0.06 },
+                );
+            }
+
+            // Draw a fade region's gain curve as a filled polyline.
+            let mut draw_fade = |r: &crate::navigator::model::Region, is_in: bool, fill: Color, line: Color| {
+                let (fs, fe) = if is_in { r.fade_span_in() } else { r.fade_span_out() };
+                let span_px = (region_x(fe) - region_x(fs)).abs().max(1.0);
+                let steps = (span_px as usize).clamp(2, 256);
+                let mut pts: Vec<Point> = Vec::with_capacity(steps + 2);
+                for i in 0..=steps {
+                    let f = fs + ((fe - fs) * i as u64) / steps as u64;
+                    let g = if is_in { r.gain_as_in(f) } else { r.gain_as_out(f) };
+                    let x = region_x(f);
+                    let y = h - g.clamp(0.0, 1.0) * h;
+                    pts.push(Point::new(x, y));
                 }
+                // Filled area under the curve.
+                if pts.len() >= 2 {
+                    let area = canvas::Path::new(|p| {
+                        p.move_to(Point::new(pts[0].x, h));
+                        for pt in &pts {
+                            p.line_to(*pt);
+                        }
+                        p.line_to(Point::new(pts[pts.len() - 1].x, h));
+                        p.close();
+                    });
+                    frame.fill(&area, fill);
+                    let curve = canvas::Path::new(|p| {
+                        p.move_to(pts[0]);
+                        for pt in &pts[1..] {
+                            p.line_to(*pt);
+                        }
+                    });
+                    frame.stroke(&curve, canvas::Stroke::default().with_color(line).with_width(1.5));
+                }
+                // Sync line.
+                let sx = region_x(r.sync_frames).clamp(0.0, w);
+                frame.fill_rectangle(Point::new(sx, 0.0), Size::new(1.0, h), line);
+            };
+
+            for r in &ov.in_regions {
+                draw_fade(
+                    r, true,
+                    Color { r: 0.20, g: 0.75, b: 0.55, a: 0.22 },
+                    Color { r: 0.30, g: 0.95, b: 0.70, a: 0.95 },
+                );
+            }
+            for r in &ov.out_regions {
+                draw_fade(
+                    r, false,
+                    Color { r: 0.95, g: 0.65, b: 0.10, a: 0.22 },
+                    Color { r: 1.0, g: 0.80, b: 0.25, a: 0.95 },
+                );
             }
         }
 
@@ -2466,6 +2756,7 @@ fn write_stereo_wav(path: &std::path::Path, interleaved: &[f32], sample_rate: u3
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lane_view(
     total_pixels: f32,
     env: Vec<f32>,
@@ -2475,9 +2766,7 @@ fn lane_view(
     pixels_per_unit: f32,
     take_offset_units: f32,
     draggable: bool,
-    total_frames: u64,
-    in_regions: Vec<crate::navigator::model::Region>,
-    out_regions: Vec<crate::navigator::model::Region>,
+    overlay: RegionOverlay,
 ) -> Element<'static, Message> {
     canvas(Lane {
         env,
@@ -2487,9 +2776,7 @@ fn lane_view(
         pixels_per_unit,
         take_offset_units,
         draggable,
-        total_frames,
-        in_regions,
-        out_regions,
+        overlay,
     })
     .width(Length::Fixed(total_pixels))
     .height(Length::Fixed(LANE_HEIGHT))
@@ -2498,37 +2785,70 @@ fn lane_view(
 
 /// Top-of-timeline ruler: tick + numeric label at every grid unit.
 /// `unit_label` is "bar" (1-based labels) or "s" (0-based seconds).
-/// Clicks emit `SetPlayheadUnits(units)` to seek the loaded take.
+/// Click seeks (`SetPlayheadUnits`); click-drag selects a range
+/// (`SetSelectionRangeUnits`) for region generation.
 struct Ruler {
     unit_label: &'static str,
     pixels_per_unit: f32,
 }
 
+/// Persisted ruler drag state (anchor of the in-progress selection).
+#[derive(Debug, Default)]
+struct RulerInteraction {
+    anchor_units: Option<f32>,
+    moved: bool,
+}
+
 impl canvas::Program<Message> for Ruler {
-    type State = ();
+    type State = RulerInteraction;
 
     fn update(
         &self,
-        _state: &mut (),
+        state: &mut RulerInteraction,
         event: canvas::Event,
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> (canvas::event::Status, Option<Message>) {
-        if let canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event {
-            if let Some(pos) = cursor.position_in(bounds) {
-                let units = (pos.x / self.pixels_per_unit).max(0.0);
-                return (
-                    canvas::event::Status::Captured,
-                    Some(Message::SetPlayheadUnits(units)),
-                );
+        match event {
+            canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                if let Some(pos) = cursor.position_in(bounds) {
+                    state.anchor_units = Some((pos.x / self.pixels_per_unit).max(0.0));
+                    state.moved = false;
+                    return (canvas::event::Status::Captured, None);
+                }
             }
+            canvas::Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                if let (Some(anchor), Some(pos)) = (state.anchor_units, cursor.position_in(bounds)) {
+                    let cur = (pos.x / self.pixels_per_unit).max(0.0);
+                    if (cur - anchor).abs() * self.pixels_per_unit > 3.0 {
+                        state.moved = true;
+                        return (
+                            canvas::event::Status::Captured,
+                            Some(Message::SetSelectionRangeUnits(anchor, cur)),
+                        );
+                    }
+                }
+            }
+            canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                if let Some(anchor) = state.anchor_units.take() {
+                    // No drag → treat as a seek click.
+                    if !state.moved {
+                        return (
+                            canvas::event::Status::Captured,
+                            Some(Message::SetPlayheadUnits(anchor)),
+                        );
+                    }
+                    state.moved = false;
+                }
+            }
+            _ => {}
         }
         (canvas::event::Status::Ignored, None)
     }
 
     fn draw(
         &self,
-        _state: &(),
+        _state: &RulerInteraction,
         renderer: &Renderer,
         _theme: &Theme,
         bounds: Rectangle,

@@ -164,6 +164,73 @@ impl Region {
             group: 0,
         }
     }
+
+    /// Base region length (frames).
+    fn span(&self) -> f32 {
+        self.end_frames.saturating_sub(self.begin_frames) as f32
+    }
+
+    /// Pixel/frame span of the **drawn fade ramp** when used as an
+    /// in-region (fade-in): `[begin, begin + fade_pct·span]`. The ramp
+    /// extends past `end` (the sync point) when `fade_pct > 1`.
+    pub fn fade_span_in(&self) -> (u64, u64) {
+        let len = (self.fade_pct * self.span()).max(1.0) as u64;
+        (self.begin_frames, self.begin_frames + len)
+    }
+
+    /// Frame span of the fade ramp when used as an out-region
+    /// (fade-out): `[end − fade_pct·span, end]`. Extends before `begin`
+    /// (the sync point) when `fade_pct > 1`.
+    pub fn fade_span_out(&self) -> (u64, u64) {
+        let len = (self.fade_pct * self.span()).max(1.0) as u64;
+        (self.end_frames.saturating_sub(len), self.end_frames)
+    }
+
+    /// Gain (0..1) at local `frame` when this region is an **in-region**.
+    /// Sync point is `end`; the fade rises from `begin` over
+    /// `fade_pct·span` frames (so for `fade_pct = 1` it reaches 1.0 at
+    /// the sync). `fade_pct = 0` ⇒ full gain throughout (pre-faded audio).
+    pub fn gain_as_in(&self, frame: u64) -> f32 {
+        if self.fade_pct <= 0.0 {
+            return 1.0;
+        }
+        let (s, e) = self.fade_span_in();
+        if frame <= s {
+            0.0
+        } else if frame >= e {
+            1.0
+        } else {
+            fade_shape_gain((frame - s) as f32 / (e - s) as f32, self.fade_shape)
+        }
+    }
+
+    /// Gain (0..1) at local `frame` when this region is an **out-region**.
+    /// Sync point is `begin`; the fade falls to 0 at `end`, starting
+    /// `fade_pct·span` frames before it. `fade_pct = 0` ⇒ full gain
+    /// throughout (pre-faded audio).
+    pub fn gain_as_out(&self, frame: u64) -> f32 {
+        if self.fade_pct <= 0.0 {
+            return 1.0;
+        }
+        let (s, e) = self.fade_span_out();
+        if frame <= s {
+            1.0
+        } else if frame >= e {
+            0.0
+        } else {
+            1.0 - fade_shape_gain((frame - s) as f32 / (e - s) as f32, self.fade_shape)
+        }
+    }
+}
+
+/// Shape a normalised 0..1 fade position. `fade_shape ≈ 0` →
+/// exponential (convex, slow start), `0.5` → linear, `≈ 1` →
+/// logarithmic (concave, fast start). Implemented as `x^k` with
+/// `k = 2^((0.5 − shape)·4)` (shape 0 → k=4, 0.5 → k=1, 1 → k=0.25).
+pub fn fade_shape_gain(x: f32, fade_shape: f32) -> f32 {
+    let x = x.clamp(0.0, 1.0);
+    let k = 2f32.powf((0.5 - fade_shape) * 4.0);
+    x.powf(k)
 }
 
 /// Stereo channel-strip values (matches Atlas `.wlamodel`
