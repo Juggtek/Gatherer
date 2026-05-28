@@ -213,10 +213,17 @@ impl AudioEngine {
             )
             .map_err(|e| format!("build_input_stream: {e}"))?;
 
-        // ---- output: play the recorded take when transport is running,
-        //      otherwise monitor the live gathered mix. ----
+        // ---- output: adaptive section playback (BP) takes priority;
+        //      else play the recorded take when transport is running;
+        //      else monitor the live gathered mix. ----
         let params_out = params.clone();
         let playback_out = playback.clone();
+        // Callback-owned mutable state (cpal closures are FnMut). The
+        // sequencer lives here; the UI publishes geometry+PCM and signals
+        // play/stop/exit via atomics on `Playback`.
+        let mut sequencer = crate::sequencer::Sequencer::new(Vec::new());
+        let mut local_gen: u64 = 0;
+        let mut seq_was_play = false;
         let output_stream = out_dev
             .build_output_stream(
                 &out_cfg,
@@ -224,7 +231,33 @@ impl AudioEngine {
                     let master = params_out.load_master_gain();
                     let frames = data.len() / out_ch.max(1);
 
-                    let take = if playback_out.is_playing() {
+                    // Adaptive program + sequencer control. Rebuild the
+                    // local sequencer when a new program generation
+                    // appears; drive start/stop on the seq_play edge.
+                    let adaptive = playback_out.adaptive_snapshot();
+                    let seq_play = playback_out.seq_is_playing();
+                    let gen = playback_out.adaptive_generation();
+                    if gen != local_gen {
+                        local_gen = gen;
+                        sequencer = match &adaptive {
+                            Some(p) => crate::sequencer::Sequencer::new(p.geometry.clone()),
+                            None => crate::sequencer::Sequencer::new(Vec::new()),
+                        };
+                        if seq_play {
+                            sequencer.start();
+                        }
+                    } else if seq_play && !seq_was_play {
+                        sequencer.start();
+                    } else if !seq_play && seq_was_play {
+                        sequencer.stop();
+                    }
+                    seq_was_play = seq_play;
+                    if seq_play && playback_out.take_seq_exit() {
+                        sequencer.trigger_exit();
+                    }
+                    let adaptive_active = adaptive.is_some() && sequencer.is_playing();
+
+                    let take = if !adaptive_active && playback_out.is_playing() {
                         playback_out.snapshot()
                     } else {
                         None
@@ -234,13 +267,68 @@ impl AudioEngine {
                     let mut mpk_l = 0f32;
                     let mut mpk_r = 0f32;
 
-                    let any_solo = if take.is_some() {
+                    let any_solo = if adaptive_active || take.is_some() {
                         params_out.any_soloed()
                     } else {
                         false
                     };
+                    // Track the sequencer's last position for UI readback.
+                    let mut last_seq_section = crate::playback::NO_SECTION;
+                    let mut last_seq_frame = 0u64;
+
                     for f in 0..frames {
                         let (mut l, mut r) = (0.0f32, 0.0f32);
+                        if adaptive_active {
+                            // Per-sample advance keeps the cross-fades
+                            // smooth. Render the (up to two) active voices.
+                            let mix = sequencer.advance(1);
+                            if let Some(prog) = &adaptive {
+                                for voice in [mix.a, mix.b].into_iter().flatten() {
+                                    last_seq_section = voice.section;
+                                    last_seq_frame = voice.frame;
+                                    let Some(sec) = prog.audio.get(voice.section) else {
+                                        continue;
+                                    };
+                                    let idx = voice.frame as usize * 2;
+                                    for (i, src) in sec.sources.iter().enumerate() {
+                                        if idx + 1 >= src.len() {
+                                            continue;
+                                        }
+                                        let src_idx = sec.armed.get(i).copied().unwrap_or(i);
+                                        let Some(sp) = params_out.sources.get(src_idx) else {
+                                            continue;
+                                        };
+                                        if sp.is_muted() || (any_solo && !sp.is_soloed()) {
+                                            continue;
+                                        }
+                                        let sign = if sp.is_inverted() { -1.0 } else { 1.0 };
+                                        let norm_g = params_out
+                                            .normalization_gains
+                                            .get(src_idx)
+                                            .map(|a| a.load(Ordering::Relaxed))
+                                            .unwrap_or(1.0);
+                                        let g = sp.load_gain() * norm_g * sign * voice.gain;
+                                        l += src[idx] * g;
+                                        r += src[idx + 1] * g;
+                                    }
+                                }
+                            }
+                            l *= master;
+                            r *= master;
+                            let base = f * out_ch;
+                            if out_ch >= 1 {
+                                data[base] = l;
+                            }
+                            if out_ch >= 2 {
+                                data[base + 1] = r;
+                            }
+                            for c in 2..out_ch {
+                                data[base + c] = 0.0;
+                            }
+                            mpk_l = mpk_l.max(l.abs());
+                            mpk_r = mpk_r.max(r.abs());
+                            continue;
+                        }
                         match &take {
                             Some(d) => {
                                 if pos < d.len_frames {
@@ -295,7 +383,9 @@ impl AudioEngine {
                         mpk_r = mpk_r.max(r.abs());
                     }
 
-                    if take.is_some() {
+                    if adaptive_active {
+                        playback_out.publish_seq_position(last_seq_section, last_seq_frame);
+                    } else if take.is_some() {
                         playback_out.set_position(pos as u64);
                         if reached_end {
                             playback_out.pause(); // hold playhead at the end

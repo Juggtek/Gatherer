@@ -98,6 +98,8 @@ pub enum Message {
     OpenSessionFolder,
     SelectSection(SectionKind),
     AddSection(SectionKind),
+    ToggleSequencePlayback,
+    TriggerSequenceExit,
     Tick,
 }
 
@@ -176,6 +178,16 @@ pub struct State {
     /// reload the right audio + bar grid. Persisted into the project
     /// tree on save.
     section_takes: HashMap<SectionKind, SectionTake>,
+    /// In-memory cache of decoded section audio + display envelopes.
+    /// Populated on first load; subsequent tab switches are instant.
+    /// Cleared when a new recording replaces the section or a new
+    /// session is loaded.
+    section_cache: HashMap<SectionKind, SectionCache>,
+}
+
+struct SectionCache {
+    data: crate::playback::PlaybackData,
+    waveforms: HashMap<usize, Vec<f32>>,
 }
 
 /// Live per-section take metadata (the bits `load_take` needs to
@@ -235,6 +247,7 @@ impl State {
             target_curve_popover_open: false,
             current_section: SectionKind::Main,
             section_takes: HashMap::new(),
+            section_cache: HashMap::new(),
         };
         state.restart_engine();
         state
@@ -364,6 +377,9 @@ impl State {
                     self.waveforms.clear();
                 }
                 if was && !now {
+                    // Invalidate the cache for the section we just recorded
+                    // so the next load hits disk (fresh data).
+                    self.section_cache.remove(&self.current_section);
                     // Load the take once the writer thread finalizes the WAVs.
                     self.pending_load_at = Some(Instant::now());
                 }
@@ -577,6 +593,30 @@ impl State {
                 self.current_section = kind;
                 self.load_section(kind);
             }
+            Message::ToggleSequencePlayback => {
+                if self.playback.seq_is_playing() {
+                    self.playback.seq_set_play(false);
+                } else {
+                    match self.build_adaptive_program() {
+                        Some(program) => {
+                            self.playback.pause(); // stop single-take transport
+                            self.playback.publish_adaptive_program(program);
+                            self.playback.seq_set_play(true);
+                            self.session_status =
+                                Some("playing adaptive sequence".into());
+                        }
+                        None => {
+                            self.session_status =
+                                Some("record at least one section first".into());
+                        }
+                    }
+                }
+            }
+            Message::TriggerSequenceExit => {
+                if self.playback.seq_is_playing() {
+                    self.playback.seq_request_exit();
+                }
+            }
             Message::Tick => {
                 self.refresh_meters();
                 if let Some(t) = self.pending_load_at {
@@ -631,6 +671,55 @@ impl State {
         self.load_section(self.current_section);
     }
 
+    /// Build an adaptive playback program from the recorded sections:
+    /// load each section's WAVs into a `SectionAudio` and derive its
+    /// geometry. Regions are empty until Phase C authors them — so v1
+    /// plays intro → main(loop) with hard hand-offs; authored regions
+    /// later give smooth crosses + exits. Returns `None` if no section
+    /// has a recorded take.
+    fn build_adaptive_program(&self) -> Option<crate::playback::AdaptiveProgram> {
+        use crate::playback::SectionAudio;
+        use crate::sequencer::AdaptiveSection;
+        let session_root = self.session_root()?;
+        let mut geometry = Vec::new();
+        let mut audio = Vec::new();
+        for kind in SectionKind::ORDER {
+            let Some(take) = self.section_takes.get(&kind) else {
+                continue;
+            };
+            let dir = crate::recording::recording_dir(&session_root, kind.slug());
+            let Ok((data, _envs)) = crate::playback::load_take(
+                &dir,
+                &take.armed,
+                take.start_pulses,
+                take.bpm,
+                take.time_sig,
+            ) else {
+                continue;
+            };
+            let len = data.len_frames as u64;
+            geometry.push(AdaptiveSection {
+                kind,
+                length: len,
+                loop_range: if kind == SectionKind::Main {
+                    Some((0, len))
+                } else {
+                    None
+                },
+                in_regions: Vec::new(),
+                out_regions: Vec::new(),
+            });
+            audio.push(SectionAudio {
+                sources: data.sources,
+                armed: data.armed,
+            });
+        }
+        if audio.is_empty() {
+            return None;
+        }
+        Some(crate::playback::AdaptiveProgram { geometry, audio })
+    }
+
     /// Resolve the session root from the recorder (last recording) or
     /// the typed session name.
     fn session_root(&self) -> Option<PathBuf> {
@@ -640,18 +729,34 @@ impl State {
         crate::session::root_for(&self.session_name)
     }
 
-    /// Load `kind`'s recorded take (if any) into the playback engine +
-    /// display envelopes, reading from `recording/<slug>/`. Clears
-    /// playback/visuals when the section has no take.
+    /// Load `kind`'s recorded take into the playback engine + display
+    /// envelopes. On a cache hit (the section was already loaded this
+    /// session) the switch is instant — no disk I/O. On a miss the WAVs
+    /// are decoded from disk and the result is stored in the cache for
+    /// the next switch. Clears playback/visuals when the section has no
+    /// recorded take.
     fn load_section(&mut self, kind: SectionKind) {
         let Some(take) = self.section_takes.get(&kind).cloned() else {
-            // No take for this section — clear the view.
             self.playback.clear();
             self.waveforms.clear();
             self.lufs_results.clear();
             self.take_user_offset_units = 0.0;
             return;
         };
+
+        // ── cache hit ──────────────────────────────────────────────
+        if let Some(cached) = self.section_cache.get(&kind) {
+            self.playback.set_take(cached.data.clone());
+            self.waveforms = cached.waveforms.clone();
+            self.take_start_pulses = take.start_pulses;
+            self.take_start_bpm = take.bpm;
+            self.take_start_time_sig = take.time_sig;
+            self.take_user_offset_units = take.user_offset_units;
+            self.refresh_normalization_gains();
+            return;
+        }
+
+        // ── cache miss: decode from disk ────────────────────────────
         let Some(session_root) = self.session_root() else {
             return;
         };
@@ -678,14 +783,20 @@ impl State {
                 }
                 self.lufs_results = measurements;
                 self.refresh_normalization_gains();
-                self.playback.set_take(data);
-                self.waveforms = envs.into_iter().collect();
+                let waveforms: HashMap<usize, Vec<f32>> = envs.into_iter().collect();
+                self.waveforms = waveforms.clone();
                 self.take_start_pulses = take.start_pulses;
                 self.take_start_bpm = take.bpm;
                 self.take_start_time_sig = take.time_sig;
                 self.take_user_offset_units = take.user_offset_units;
                 self.last_export_dir = None;
                 self.export_error = None;
+                // Populate the cache so next switch is instant.
+                self.section_cache.insert(kind, SectionCache {
+                    data: data.clone(),
+                    waveforms,
+                });
+                self.playback.set_take(data);
             }
             Err(e) => self.error = Some(format!("load take: {e}")),
         }
@@ -796,6 +907,10 @@ impl State {
         names.resize(self.num_sources, String::new());
         self.layer_names = names;
 
+        // Drop any adaptive program from the previous session and clear
+        // the section cache (stale audio from a different session).
+        self.playback.clear_adaptive_program();
+        self.section_cache.clear();
         // Phase B0: repopulate the live per-section take map from the
         // loaded project tree.
         self.section_takes.clear();
@@ -1352,12 +1467,23 @@ impl State {
                 button(text("+ Intro").size(11)).on_press(Message::AddSection(SectionKind::Intro)),
             )
             .push(button(text("+ Outro").size(11)).on_press(Message::AddSection(SectionKind::Outro)));
-        // Reserved for Phase BP (adaptive playback): disabled buttons
-        // (no on_press) until the engine exists.
+        // Adaptive playback (Phase BP): Play sequence runs the
+        // intro→main→outro sequencer; Trigger exit defers Main → Outro
+        // at the next out-region.
+        let playing_seq = self.playback.seq_is_playing();
+        let play_label = if playing_seq {
+            "\u{25A0} Stop sequence"
+        } else {
+            "\u{25B6} Play sequence"
+        };
+        let mut trigger = button(text("Trigger exit").size(11));
+        if playing_seq {
+            trigger = trigger.on_press(Message::TriggerSequenceExit);
+        }
         row_el = row_el
             .push(Space::with_width(Length::Fill))
-            .push(button(text("Trigger exit").size(11)))
-            .push(button(text("Play sequence").size(11)));
+            .push(trigger)
+            .push(button(text(play_label).size(11)).on_press(Message::ToggleSequencePlayback));
         row_el.into()
     }
 
@@ -1864,18 +1990,33 @@ impl canvas::Program<Message> for Lane {
             x += self.pixels_per_unit;
         }
 
-        // Waveform (normalized per take so quiet recordings still fill the lane).
+        // Waveform — normalized and rendered at 1-px column resolution so the
+        // display is crisp at any zoom and for any envelope size.
+        // Each pixel column samples the max peak from all envelope buckets that
+        // fall within that pixel's time range, giving correct behaviour when the
+        // take spans thousands of pixels (many buckets per pixel) or only a few
+        // hundred pixels (sub-pixel buckets) by taking the peak either way.
         let n = self.env.len();
         if n > 0 && self.take_end_x > self.take_start_x {
             let take_w = self.take_end_x - self.take_start_x;
-            let col_w = (take_w / n as f32).max(1.0);
             let max = self.env.iter().cloned().fold(1e-6_f32, f32::max);
             let wave = Color::from_rgb(0.45, 0.72, 1.0);
-            for (i, &amp) in self.env.iter().enumerate() {
-                let half = (amp / max).clamp(0.0, 1.0) * mid;
-                let xp = self.take_start_x + i as f32 / n as f32 * take_w;
+            let px_start = self.take_start_x.max(0.0) as usize;
+            let px_end = (self.take_end_x.min(w)) as usize;
+            for px in px_start..px_end {
+                // Map this pixel column to a range of envelope buckets.
+                let t0 = (px as f32 - self.take_start_x) / take_w;
+                let t1 = (px as f32 + 1.0 - self.take_start_x) / take_w;
+                let b0 = ((t0 * n as f32) as usize).min(n - 1);
+                let b1 = ((t1 * n as f32).ceil() as usize).clamp(b0 + 1, n);
+                let peak = self.env[b0..b1].iter().cloned().fold(0.0f32, f32::max);
+                let half = (peak / max).clamp(0.0, 1.0) * mid;
                 let bar_h = (half * 2.0).max(1.0);
-                frame.fill_rectangle(Point::new(xp, mid - half), Size::new(col_w, bar_h), wave);
+                frame.fill_rectangle(
+                    Point::new(px as f32, mid - half),
+                    Size::new(1.0, bar_h),
+                    wave,
+                );
             }
         }
 
