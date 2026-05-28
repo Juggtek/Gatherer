@@ -8,7 +8,7 @@
 
 use atomic_float::AtomicF32;
 use rtrb::{Consumer, Producer};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
@@ -166,15 +166,19 @@ impl RecorderControl {
         }
     }
 
-    pub fn toggle(&mut self, sample_rate: u32, session_name: &str) {
+    /// `section_slug` namespaces the recording under
+    /// `<root>/recording/<slug>/` so each adaptive section (intro / main
+    /// / outro) records into its own folder. Pass `""` for the legacy
+    /// flat `<root>/recording/` layout.
+    pub fn toggle(&mut self, sample_rate: u32, session_name: &str, section_slug: &str) {
         if self.recording {
             self.stop();
         } else {
-            self.start(sample_rate, session_name);
+            self.start(sample_rate, session_name, section_slug);
         }
     }
 
-    fn start(&mut self, sample_rate: u32, session_name: &str) {
+    fn start(&mut self, sample_rate: u32, session_name: &str, section_slug: &str) {
         let armed: Vec<usize> = (0..self.state.num_sources())
             .filter(|&s| self.state.is_armed(s))
             .collect();
@@ -195,7 +199,11 @@ impl RecorderControl {
                 return;
             }
         };
-        let recording_dir = session_root.join("recording");
+        let recording_dir = if section_slug.is_empty() {
+            session_root.join("recording")
+        } else {
+            session_root.join("recording").join(section_slug)
+        };
         if let Err(e) = std::fs::create_dir_all(&recording_dir) {
             self.error = Some(format!("create {}: {e}", recording_dir.display()));
             return;
@@ -348,6 +356,23 @@ fn finalize(writers: &mut [Option<Wav>]) {
                 eprintln!("recorder: finalize: {e}");
             }
         }
+    }
+}
+
+/// Recording folder for a section: `<root>/recording/<slug>/`, or the
+/// flat `<root>/recording/` when `slug` is empty. Falls back to the
+/// flat layout if the per-section folder doesn't exist but the flat one
+/// does (so legacy single-take recordings still load).
+pub fn recording_dir(session_root: &Path, slug: &str) -> PathBuf {
+    if slug.is_empty() {
+        return session_root.join("recording");
+    }
+    let per_section = session_root.join("recording").join(slug);
+    let flat = session_root.join("recording");
+    if !per_section.exists() && flat.join("source-01.wav").exists() {
+        flat
+    } else {
+        per_section
     }
 }
 

@@ -35,3 +35,6 @@ toml = "0.8"
 # synchronously — the dialog blocks the iced event loop while it's open,
 # which is normal UX for a modal "pick a file".
 rfd = "0.15"
+# Stable v4 UUIDs for the project-tree node identities (asset / page /
+# module / section / pattern) — matches the engine's uuid-keyed model.
+uuid = { version = "1", features = ["v4", "serde"] }

@@ -13,6 +13,7 @@ mod audio;
 mod export;
 mod measurement;
 mod midi;
+mod navigator;
 mod params;
 mod playback;
 mod recording;

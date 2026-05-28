@@ -6,6 +6,7 @@
 //! widgets for now; FIELD's canvas meters/faders are a later polish pass.
 
 use crate::adaptive::{AdaptiveMixer, Mode, Mood, SlotField, SLOT_COUNT};
+use crate::navigator::SectionKind;
 use crate::audio::{self, AudioEngine};
 use crate::measurement::{self, LufsMeasurement};
 use crate::midi::{self, MidiSync, PPQN};
@@ -95,6 +96,8 @@ pub enum Message {
     ImportTemplate,
     ExportTemplate,
     OpenSessionFolder,
+    SelectSection(SectionKind),
+    AddSection(SectionKind),
     Tick,
 }
 
@@ -164,6 +167,27 @@ pub struct State {
     /// expands a panel above the control strip that shows + edits the
     /// current mode's target curve.
     target_curve_popover_open: bool,
+
+    /// Active adaptive section. Recording, playback, and waveforms all
+    /// target this section's `recording/<slug>/` folder. (Phase B0; the
+    /// full project tree is authored in B1.)
+    current_section: SectionKind,
+    /// Per-section recorded-take metadata, so switching sections can
+    /// reload the right audio + bar grid. Persisted into the project
+    /// tree on save.
+    section_takes: HashMap<SectionKind, SectionTake>,
+}
+
+/// Live per-section take metadata (the bits `load_take` needs to
+/// reconstruct playback + the bar grid for a section). Mirrors what a
+/// `Pattern`'s `clip_source.take` stores in the persisted project.
+#[derive(Debug, Clone)]
+struct SectionTake {
+    armed: Vec<usize>,
+    start_pulses: u64,
+    bpm: f32,
+    time_sig: u32,
+    user_offset_units: f32,
 }
 
 impl State {
@@ -209,6 +233,8 @@ impl State {
             session_status: None,
             adaptive: AdaptiveMixer::new(),
             target_curve_popover_open: false,
+            current_section: SectionKind::Main,
+            section_takes: HashMap::new(),
         };
         state.restart_engine();
         state
@@ -301,9 +327,10 @@ impl State {
             Message::ToggleRecord => {
                 let sr = self.engine.as_ref().map(|e| e.sample_rate as u32).unwrap_or(48000);
                 let session_name = self.session_name.clone();
+                let slug = self.current_section.slug();
                 let (was, now) = if let Some(r) = self.recorder.as_mut() {
                     let was = r.recording;
-                    r.toggle(sr, &session_name);
+                    r.toggle(sr, &session_name, slug);
                     (was, r.recording)
                 } else {
                     (false, false)
@@ -532,6 +559,24 @@ impl State {
                     }
                 }
             }
+            Message::SelectSection(kind) => {
+                if kind != self.current_section {
+                    // Stash the current section's drag offset before
+                    // switching so it survives the round-trip.
+                    if let Some(t) = self.section_takes.get_mut(&self.current_section) {
+                        t.user_offset_units = self.take_user_offset_units;
+                    }
+                    self.current_section = kind;
+                    self.load_section(kind);
+                }
+            }
+            Message::AddSection(kind) => {
+                // B0: sections are implicit (one of each). "Add" just
+                // focuses the section so the user can record into it;
+                // B1 makes the tree explicit + multi-instance.
+                self.current_section = kind;
+                self.load_section(kind);
+            }
             Message::Tick => {
                 self.refresh_meters();
                 if let Some(t) = self.pending_load_at {
@@ -561,38 +606,71 @@ impl State {
         self.master_peak_db = decay(self.master_peak_db, linear_to_db(ml.max(mr)));
     }
 
-    /// Read the last recorded take's WAVs into the playback engine and build
-    /// the display envelopes. Called shortly after recording stops.
+    /// Called shortly after recording stops: capture the just-recorded
+    /// take's metadata into `section_takes[current_section]`, then load
+    /// that section so it plays back.
     fn load_take(&mut self) {
-        let Some(r) = self.recorder.as_ref() else {
-            return;
-        };
-        let Some(session_root) = r.last_session.clone() else {
-            return;
-        };
-        let armed = r.last_armed.clone();
+        let armed = self
+            .recorder
+            .as_ref()
+            .map(|r| r.last_armed.clone())
+            .unwrap_or_default();
         if armed.is_empty() {
             return;
         }
-        // Recording WAVs live under `<session_root>/recording/`.
-        let recording_dir = session_root.join("recording");
+        self.section_takes.insert(
+            self.current_section,
+            SectionTake {
+                armed,
+                start_pulses: self.take_start_pulses,
+                bpm: self.take_start_bpm,
+                time_sig: self.take_start_time_sig,
+                user_offset_units: 0.0,
+            },
+        );
+        self.load_section(self.current_section);
+    }
+
+    /// Resolve the session root from the recorder (last recording) or
+    /// the typed session name.
+    fn session_root(&self) -> Option<PathBuf> {
+        if let Some(root) = self.recorder.as_ref().and_then(|r| r.last_session.clone()) {
+            return Some(root);
+        }
+        crate::session::root_for(&self.session_name)
+    }
+
+    /// Load `kind`'s recorded take (if any) into the playback engine +
+    /// display envelopes, reading from `recording/<slug>/`. Clears
+    /// playback/visuals when the section has no take.
+    fn load_section(&mut self, kind: SectionKind) {
+        let Some(take) = self.section_takes.get(&kind).cloned() else {
+            // No take for this section — clear the view.
+            self.playback.clear();
+            self.waveforms.clear();
+            self.lufs_results.clear();
+            self.take_user_offset_units = 0.0;
+            return;
+        };
+        let Some(session_root) = self.session_root() else {
+            return;
+        };
+        let recording_dir = crate::recording::recording_dir(&session_root, kind.slug());
         match crate::playback::load_take(
             &recording_dir,
-            &armed,
-            self.take_start_pulses,
-            self.take_start_bpm,
-            self.take_start_time_sig,
+            &take.armed,
+            take.start_pulses,
+            take.bpm,
+            take.time_sig,
         ) {
             Ok((data, envs)) => {
-                // Per-source LUFS measurement (integrated + max short-term +
-                // max momentary). Synchronous; takes ~100ms per minute of audio.
                 let sr_u = self
                     .engine
                     .as_ref()
                     .map(|e| e.sample_rate as u32)
                     .unwrap_or(48_000);
                 let mut measurements = HashMap::new();
-                for (i, &src_idx) in armed.iter().enumerate() {
+                for (i, &src_idx) in take.armed.iter().enumerate() {
                     if let Some(samples) = data.sources.get(i) {
                         measurements
                             .insert(src_idx, measurement::measure(samples, 2, sr_u));
@@ -602,7 +680,10 @@ impl State {
                 self.refresh_normalization_gains();
                 self.playback.set_take(data);
                 self.waveforms = envs.into_iter().collect();
-                self.take_user_offset_units = 0.0;
+                self.take_start_pulses = take.start_pulses;
+                self.take_start_bpm = take.bpm;
+                self.take_start_time_sig = take.time_sig;
+                self.take_user_offset_units = take.user_offset_units;
                 self.last_export_dir = None;
                 self.export_error = None;
             }
@@ -651,29 +732,38 @@ impl State {
             .as_ref()
             .map(|e| e.sample_rate as u32)
             .unwrap_or(48_000);
-        let take = self.recorder.as_ref().and_then(|r| {
-            if r.last_armed.is_empty() {
-                None
-            } else {
-                Some(crate::session::TakeState {
-                    armed: r.last_armed.clone(),
-                    start_pulses: self.take_start_pulses,
-                    bpm: self.take_start_bpm,
-                    time_sig_num: self.take_start_time_sig,
-                    take_user_offset_units: self.take_user_offset_units,
-                })
-            }
-        });
-        let state = crate::session::SessionState {
-            session_name: self.session_name.clone(),
-            sample_rate: sr,
-            time_sig_num: self.time_sig_num,
-            target_lufs: self.target_lufs,
-            zoom: self.zoom,
-            snap_to_grid: self.snap_to_grid,
-            layer_names: self.layer_names.clone(),
-            take,
-        };
+        // Snapshot the active section's live drag offset before
+        // serialising, so it persists.
+        if let Some(t) = self.section_takes.get_mut(&self.current_section) {
+            t.user_offset_units = self.take_user_offset_units;
+        }
+        // Phase B0: persist every recorded section into the project tree.
+        let takes: Vec<(SectionKind, crate::session::TakeState)> = self
+            .section_takes
+            .iter()
+            .map(|(kind, st)| {
+                (
+                    *kind,
+                    crate::session::TakeState {
+                        armed: st.armed.clone(),
+                        start_pulses: st.start_pulses,
+                        bpm: st.bpm,
+                        time_sig_num: st.time_sig,
+                        take_user_offset_units: st.user_offset_units,
+                    },
+                )
+            })
+            .collect();
+        let state = crate::session::SessionState::with_section_takes(
+            self.session_name.clone(),
+            sr,
+            self.time_sig_num,
+            self.target_lufs,
+            self.zoom,
+            self.snap_to_grid,
+            self.layer_names.clone(),
+            takes,
+        );
         match crate::session::save(&session_root, &state) {
             Ok(()) => {
                 self.session_status =
@@ -702,36 +792,52 @@ impl State {
         self.zoom = sess.zoom.clamp(0.15, 8.0);
         self.snap_to_grid = sess.snap_to_grid;
         self.time_sig_num = sess.time_sig_num.max(1);
-        let mut names = sess.layer_names;
+        let mut names = sess.layer_names.clone();
         names.resize(self.num_sources, String::new());
         self.layer_names = names;
 
-        if let Some(take) = sess.take {
-            // Plant the recorder pointers so `load_take` reads from this
-            // session's `recording/` folder.
-            if let Some(rec) = self.recorder.as_mut() {
-                rec.last_session = Some(session_root.clone());
-                rec.last_session_name = Some(sess.session_name.clone());
-                rec.last_armed = take.armed.clone();
-            }
-            self.take_start_pulses = take.start_pulses;
-            self.take_start_bpm = take.bpm;
-            self.take_start_time_sig = take.time_sig_num;
-            self.take_user_offset_units = take.take_user_offset_units;
-            self.load_take();
-            self.session_status =
-                Some(format!("loaded \u{2192} {}", session_root.display()));
-        } else {
-            // No take in the saved session — clear playback + visuals.
-            self.playback.clear();
-            self.waveforms.clear();
-            self.lufs_results.clear();
-            self.take_user_offset_units = 0.0;
-            self.session_status = Some(format!(
-                "loaded (no take) \u{2192} {}",
-                session_root.display()
-            ));
+        // Phase B0: repopulate the live per-section take map from the
+        // loaded project tree.
+        self.section_takes.clear();
+        for (kind, take) in sess.section_takes() {
+            self.section_takes.insert(
+                kind,
+                SectionTake {
+                    armed: take.armed,
+                    start_pulses: take.start_pulses,
+                    bpm: take.bpm,
+                    time_sig: take.time_sig_num,
+                    user_offset_units: take.take_user_offset_units,
+                },
+            );
         }
+        // Plant the recorder's session pointer so the section loader +
+        // export resolve paths under this session's folder.
+        if let Some(rec) = self.recorder.as_mut() {
+            rec.last_session = Some(session_root.clone());
+            rec.last_session_name = Some(sess.session_name.clone());
+            if let Some(t) = self.section_takes.get(&SectionKind::Main) {
+                rec.last_armed = t.armed.clone();
+            }
+        }
+        // Focus a section that has audio: prefer Main, else the first
+        // recorded one, else Main (empty).
+        let focus = if self.section_takes.contains_key(&SectionKind::Main) {
+            SectionKind::Main
+        } else {
+            SectionKind::ORDER
+                .into_iter()
+                .find(|k| self.section_takes.contains_key(k))
+                .unwrap_or(SectionKind::Main)
+        };
+        self.current_section = focus;
+        self.load_section(focus);
+        let n = self.section_takes.len();
+        self.session_status = Some(if n == 0 {
+            format!("loaded (no takes) \u{2192} {}", session_root.display())
+        } else {
+            format!("loaded {n} section(s) \u{2192} {}", session_root.display())
+        });
     }
 
     fn do_export_stems(&mut self) {
@@ -995,6 +1101,10 @@ impl State {
         // the timeline body and the control strip.
         let masks_strip = self.masks_strip();
 
+        // Section tabs (Intro / Main / Outro) sit just above the
+        // timeline — switching swaps the recording target + playback.
+        let section_tabs = self.section_tabs();
+
         // Body is the full layout — main_body has Length::Fill so the
         // control strip pins to the bottom of the window.
         let body: Element<'_, Message> = column![
@@ -1003,6 +1113,7 @@ impl State {
             mixer_view,
             action_strip,
             action_status,
+            section_tabs,
             main_body,
             masks_strip,
             control_strip,
@@ -1212,6 +1323,44 @@ impl State {
     /// together. A per-source total-volume column on the far right
     /// reads the live `params.sources[i].gain` (post-slew, what the
     /// audio thread sees this tick).
+    /// Section tabs: Intro / Main / Outro. The active one is highlighted;
+    /// a `\u{25CF}` marks sections that already hold a recorded take.
+    /// "Trigger exit" + "Play sequence" are reserved for Phase BP and
+    /// stay disabled (no `on_press`) until the adaptive player lands.
+    fn section_tabs(&self) -> Element<'_, Message> {
+        let mut row_el = row![text("Section").size(12)]
+            .spacing(6)
+            .align_y(Alignment::Center);
+        for kind in SectionKind::ORDER {
+            let recorded = self.section_takes.contains_key(&kind);
+            let label = if recorded {
+                format!("\u{25CF} {}", kind.label())
+            } else {
+                kind.label().to_string()
+            };
+            let mut b = button(text(label).size(12)).on_press(Message::SelectSection(kind));
+            b = if kind == self.current_section {
+                b.style(button::primary)
+            } else {
+                b.style(button::secondary)
+            };
+            row_el = row_el.push(b);
+        }
+        row_el = row_el
+            .push(Space::with_width(Length::Fixed(16.0)))
+            .push(
+                button(text("+ Intro").size(11)).on_press(Message::AddSection(SectionKind::Intro)),
+            )
+            .push(button(text("+ Outro").size(11)).on_press(Message::AddSection(SectionKind::Outro)));
+        // Reserved for Phase BP (adaptive playback): disabled buttons
+        // (no on_press) until the engine exists.
+        row_el = row_el
+            .push(Space::with_width(Length::Fill))
+            .push(button(text("Trigger exit").size(11)))
+            .push(button(text("Play sequence").size(11)));
+        row_el.into()
+    }
+
     fn masks_strip(&self) -> Element<'_, Message> {
         const SLIDER_H: f32 = 48.0;
         const SLIDER_W: f32 = 14.0;
