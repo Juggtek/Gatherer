@@ -100,6 +100,15 @@ pub enum Message {
     AddSection(SectionKind),
     ToggleSequencePlayback,
     TriggerSequenceExit,
+    // ── Phase C: region authoring ──────────────────────────────────
+    /// Drop an out-region at the current playhead on the active section.
+    AddOutRegionAtPlayhead,
+    /// Generate evenly-spaced out-regions every `bars` bars across the
+    /// active section's full length.
+    GenerateExitRegions,
+    SetExitBars(u32),
+    /// Remove all in/out regions from the active section.
+    ClearRegions,
     Tick,
 }
 
@@ -170,6 +179,8 @@ pub struct State {
     /// current mode's target curve.
     target_curve_popover_open: bool,
 
+    /// "Generate exits every N bars" parameter (Phase C). Default 2 bars.
+    exit_bars: u32,
     /// Active adaptive section. Recording, playback, and waveforms all
     /// target this section's `recording/<slug>/` folder. (Phase B0; the
     /// full project tree is authored in B1.)
@@ -200,6 +211,11 @@ struct SectionTake {
     bpm: f32,
     time_sig: u32,
     user_offset_units: f32,
+    /// Transition regions authored on top of this take's waveform.
+    /// Not yet persisted to session.toml — re-author or re-generate after
+    /// each session load until Phase B1 wires them through the project tree.
+    in_regions: Vec<crate::navigator::model::Region>,
+    out_regions: Vec<crate::navigator::model::Region>,
 }
 
 impl State {
@@ -245,6 +261,7 @@ impl State {
             session_status: None,
             adaptive: AdaptiveMixer::new(),
             target_curve_popover_open: false,
+            exit_bars: 2,
             current_section: SectionKind::Main,
             section_takes: HashMap::new(),
             section_cache: HashMap::new(),
@@ -617,6 +634,65 @@ impl State {
                     self.playback.seq_request_exit();
                 }
             }
+            Message::SetExitBars(n) => {
+                self.exit_bars = n.max(1);
+            }
+            Message::AddOutRegionAtPlayhead => {
+                let sr = self.engine.as_ref().map(|e| e.sample_rate).unwrap_or(48_000.0);
+                let pos_frames = (self.playback.position() as f32) as u64;
+                // 2-beat fade window centred on the playhead (arbitrary sane default).
+                let beat_frames = if self.take_start_bpm > 0.0 {
+                    (sr * 60.0 / self.take_start_bpm) as u64
+                } else {
+                    (sr * 0.5) as u64 // 500 ms fallback
+                };
+                let fade_len = beat_frames;
+                let region = crate::navigator::model::Region::new_out(
+                    pos_frames,
+                    pos_frames + fade_len,
+                    1.0,
+                    0.756,
+                );
+                if let Some(t) = self.section_takes.get_mut(&self.current_section) {
+                    t.out_regions.push(region);
+                    t.out_regions.sort_by_key(|r| r.begin_frames);
+                }
+            }
+            Message::GenerateExitRegions => {
+                let sr = self.engine.as_ref().map(|e| e.sample_rate).unwrap_or(48_000.0);
+                let bpm = self.take_start_bpm;
+                let beats_per_bar = self.take_start_time_sig as f32;
+                let cached_len = self.section_cache.get(&self.current_section)
+                    .map(|c| c.data.len_frames as u64)
+                    .unwrap_or(0);
+                if cached_len == 0 || bpm <= 0.0 {
+                    return Task::none();
+                }
+                let bar_frames = (sr * 60.0 / bpm * beats_per_bar) as u64;
+                let exit_bars = self.exit_bars as u64;
+                let interval = bar_frames * exit_bars;
+                let fade_frames = bar_frames / 2; // half-bar fade
+                let mut regions = Vec::new();
+                let mut pos = interval;
+                while pos + fade_frames < cached_len {
+                    regions.push(crate::navigator::model::Region::new_out(
+                        pos,
+                        pos + fade_frames,
+                        1.0,
+                        0.756,
+                    ));
+                    pos += interval;
+                }
+                if let Some(t) = self.section_takes.get_mut(&self.current_section) {
+                    t.out_regions = regions;
+                }
+            }
+            Message::ClearRegions => {
+                if let Some(t) = self.section_takes.get_mut(&self.current_section) {
+                    t.in_regions.clear();
+                    t.out_regions.clear();
+                }
+            }
             Message::Tick => {
                 self.refresh_meters();
                 if let Some(t) = self.pending_load_at {
@@ -658,6 +734,11 @@ impl State {
         if armed.is_empty() {
             return;
         }
+        // Preserve any regions the user authored before re-recording.
+        let prev_in = self.section_takes.get(&self.current_section)
+            .map(|t| t.in_regions.clone()).unwrap_or_default();
+        let prev_out = self.section_takes.get(&self.current_section)
+            .map(|t| t.out_regions.clone()).unwrap_or_default();
         self.section_takes.insert(
             self.current_section,
             SectionTake {
@@ -666,6 +747,8 @@ impl State {
                 bpm: self.take_start_bpm,
                 time_sig: self.take_start_time_sig,
                 user_offset_units: 0.0,
+                in_regions: prev_in,
+                out_regions: prev_out,
             },
         );
         self.load_section(self.current_section);
@@ -698,6 +781,8 @@ impl State {
                 continue;
             };
             let len = data.len_frames as u64;
+            let authored_in = take.in_regions.clone();
+            let authored_out = take.out_regions.clone();
             geometry.push(AdaptiveSection {
                 kind,
                 length: len,
@@ -706,8 +791,8 @@ impl State {
                 } else {
                     None
                 },
-                in_regions: Vec::new(),
-                out_regions: Vec::new(),
+                in_regions: authored_in,
+                out_regions: authored_out,
             });
             audio.push(SectionAudio {
                 sources: data.sources,
@@ -923,6 +1008,8 @@ impl State {
                     bpm: take.bpm,
                     time_sig: take.time_sig_num,
                     user_offset_units: take.take_user_offset_units,
+                    in_regions: Vec::new(),
+                    out_regions: Vec::new(),
                 },
             );
         }
@@ -1128,6 +1215,16 @@ impl State {
             button(text("100%")).on_press(Message::ZoomReset),
             Space::with_width(Length::Fixed(8.0)),
             checkbox("Snap", self.snap_to_grid).on_toggle(Message::ToggleSnap),
+            Space::with_width(Length::Fixed(12.0)),
+            text("Regions").size(11),
+            button(text("+Exit").size(11)).on_press(Message::AddOutRegionAtPlayhead),
+            text("every").size(11),
+            slider(1u32..=32, self.exit_bars, Message::SetExitBars)
+                .step(1u32)
+                .width(Length::Fixed(80.0)),
+            text(format!("{}bar", self.exit_bars)).size(11).width(Length::Fixed(36.0)),
+            button(text("Generate").size(11)).on_press(Message::GenerateExitRegions),
+            button(text("Clear").size(11)).on_press(Message::ClearRegions),
             Space::with_width(Length::Fill),
             // Template I/O — Max-patch 97-float .txt format. Import opens
             // a native file dialog (last dir remembered between launches
@@ -1710,6 +1807,19 @@ impl State {
             } else {
                 (take_start_x, take_end_x)
             };
+            // Regions from the active section (only the first source row
+            // shows the overlay visually; same data for all lanes).
+            let (total_frames, in_r, out_r) = if !recording && i == 0 {
+                if let Some(t) = self.section_takes.get(&self.current_section) {
+                    let len = self.section_cache.get(&self.current_section)
+                        .map(|c| c.data.len_frames as u64).unwrap_or(0);
+                    (len, t.in_regions.clone(), t.out_regions.clone())
+                } else {
+                    (0, Vec::new(), Vec::new())
+                }
+            } else {
+                (0, Vec::new(), Vec::new())
+            };
             timeline_col = timeline_col.push(lane_view(
                 total_pixels,
                 env,
@@ -1719,6 +1829,9 @@ impl State {
                 pixels_per_unit,
                 offset_units,
                 draggable,
+                total_frames,
+                in_r,
+                out_r,
             ));
         }
 
@@ -1881,6 +1994,10 @@ struct Lane {
     /// Only loaded takes can be dragged; live previews and empty lanes are
     /// click-to-seek only.
     draggable: bool,
+    /// Total length of the take in sample frames (for region → pixel mapping).
+    total_frames: u64,
+    in_regions: Vec<crate::navigator::model::Region>,
+    out_regions: Vec<crate::navigator::model::Region>,
 }
 
 /// Per-Lane drag state, persisted by iced between renders of the same
@@ -2020,6 +2137,44 @@ impl canvas::Program<Message> for Lane {
             }
         }
 
+        // Region overlays: in-regions (blue-green) and out-regions (amber).
+        // Drawn as semi-transparent bands over the waveform.
+        if self.total_frames > 0 && self.take_end_x > self.take_start_x {
+            let take_w = self.take_end_x - self.take_start_x;
+            let frames = self.total_frames as f32;
+            let region_x = |f: u64| self.take_start_x + (f as f32 / frames) * take_w;
+            for r in &self.in_regions {
+                let x0 = region_x(r.begin_frames).max(0.0);
+                let x1 = region_x(r.end_frames).min(w);
+                if x1 > x0 {
+                    frame.fill_rectangle(
+                        Point::new(x0, 0.0),
+                        Size::new(x1 - x0, h),
+                        Color { r: 0.20, g: 0.75, b: 0.55, a: 0.28 },
+                    );
+                    // sync line
+                    let sx = region_x(r.sync_frames).clamp(0.0, w);
+                    frame.fill_rectangle(Point::new(sx, 0.0), Size::new(1.0, h),
+                        Color { r: 0.25, g: 0.90, b: 0.65, a: 0.80 });
+                }
+            }
+            for r in &self.out_regions {
+                let x0 = region_x(r.begin_frames).max(0.0);
+                let x1 = region_x(r.end_frames).min(w);
+                if x1 > x0 {
+                    frame.fill_rectangle(
+                        Point::new(x0, 0.0),
+                        Size::new(x1 - x0, h),
+                        Color { r: 0.95, g: 0.65, b: 0.10, a: 0.25 },
+                    );
+                    // sync line
+                    let sx = region_x(r.sync_frames).clamp(0.0, w);
+                    frame.fill_rectangle(Point::new(sx, 0.0), Size::new(1.0, h),
+                        Color { r: 1.0, g: 0.80, b: 0.20, a: 0.85 });
+                }
+            }
+        }
+
         // Playhead (only while a loaded take is being played).
         if let Some(px) = self.playhead_x {
             if px >= 0.0 && px <= w {
@@ -2045,6 +2200,9 @@ fn lane_view(
     pixels_per_unit: f32,
     take_offset_units: f32,
     draggable: bool,
+    total_frames: u64,
+    in_regions: Vec<crate::navigator::model::Region>,
+    out_regions: Vec<crate::navigator::model::Region>,
 ) -> Element<'static, Message> {
     canvas(Lane {
         env,
@@ -2054,6 +2212,9 @@ fn lane_view(
         pixels_per_unit,
         take_offset_units,
         draggable,
+        total_frames,
+        in_regions,
+        out_regions,
     })
     .width(Length::Fixed(total_pixels))
     .height(Length::Fixed(LANE_HEIGHT))
